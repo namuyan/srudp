@@ -1,0 +1,2 @@
+ecdsa>=0.13
+pycryptodomex>=3.9.4
