@@ -43,13 +43,51 @@ MAX_RETRANSMIT_LIMIT = 4
 FULL_SIZE_PACKET_WAIT = 0.001  # sec
 
 
+class CycInt(int):
+    """
+    cycle 4bytes unsigned integer
+    loop 0 ~ 0xffffffff
+    """
+    def __add__(self, other: int) -> 'CycInt':
+        return CycInt(super().__add__(other) % 0x100000000)
+
+    def __sub__(self, other: int) -> 'CycInt':
+        return CycInt(super().__sub__(other) % 0x100000000)
+
+    def __hash__(self) -> int:
+        return self % 0x100000000
+
+    def __lt__(self, other: int) -> bool:
+        """self<value"""
+        i = int(self)
+        other = int(other)
+        if i < 0x3fffffff:
+            if other < 0xbfffffff:
+                return i < other
+            else:
+                return False
+        elif i < 0xbfffffff:
+            return i < other
+        else:
+            if other < 0x3fffffff:
+                return True
+            else:
+                return i < other
+
+    def __le__(self, other: int) -> bool:
+        """self<=value"""
+        if self == other:
+            return True
+        return self.__lt__(other)
+
+
 class Packet(NamedTuple):
     """
     static 14b
     [control 1b]-[sequence(ack) 4b]-[retry 1b]-[time 8b]-[data xb]
     """
     control: int  # control bit
-    sequence: int  # packet order (disconnected before overflow)
+    sequence: CycInt  # packet order (cycle 4bytes uint)
     retry: int  # re-transmission count (disconnected before overflow)
     time: float  # unix time (double)
     data: bytes  # data body
@@ -61,13 +99,13 @@ class Packet(NamedTuple):
 
 
 def bin2packet(b: bytes):
-    c, s, r, t = packet_struct.unpack_from(b)
-    return Packet(c, s, r, t, b[packet_struct.size:])
+    c, seq, r, t = packet_struct.unpack_from(b)
+    return Packet(c, CycInt(seq), r, t, b[packet_struct.size:])
 
 
 def packet2bin(p: Packet):
     # log.debug("s>> %s", p)
-    return packet_struct.pack(p.control, p.sequence, p.retry, p.time) + p.data
+    return packet_struct.pack(p.control, int(p.sequence), p.retry, p.time) + p.data
 
 
 class SecureReliableSocket(socket):
@@ -89,12 +127,12 @@ class SecureReliableSocket(socket):
         self.mtu_size = 0  # 1472b
         self.mtu_multiple = 1  # 1 to 4096
         # sender params
-        self.sender_seq = 1  # next send sequence
+        self.sender_seq = CycInt(1)  # next send sequence
         self.sender_buffer = deque()
         self.sender_signal = threading.Event()  # clear when buffer is empty
         self.sender_buffer_lock = threading.Lock()
         # receiver params
-        self.receiver_seq = 1  # next receive sequence
+        self.receiver_seq = CycInt(1)  # next receive sequence
         self.receiver_buffer = BytesIO()
         self.receiver_signal = threading.Event()
         self.receiver_buffer_lock = threading.Lock()
@@ -241,7 +279,7 @@ class SecureReliableSocket(socket):
 
             # connection may be broken
             if self.timeout < time() - last_receive_time:
-                p = Packet(CONTROL_FIN, 0, 0, time(), b'stream may be broken')
+                p = Packet(CONTROL_FIN, CycInt(0), 0, time(), b'stream may be broken')
                 self.sendto(self._encrypt(packet2bin(p)), self.address)
                 break
 
@@ -250,7 +288,7 @@ class SecureReliableSocket(socket):
                 try:
                     new_mtu = self.mtu_size * min(self.mtu_multiple + 1, 4096)
                     size = 16 * (new_mtu // 16 - 1) - packet_struct.size - 1
-                    p = Packet(CONTROL_MTU, new_mtu, 0, time(), b'#' * size)
+                    p = Packet(CONTROL_MTU, CycInt(new_mtu), 0, time(), b'#' * size)
                     self.sendto(self._encrypt(packet2bin(p)), self.address)
                 except s.error:
                     pass  # Message too long
@@ -281,12 +319,7 @@ class SecureReliableSocket(socket):
 
                 # receive reset
                 if packet.control & CONTROL_FIN:
-                    p = Packet(CONTROL_FIN, 0, 0, time(), b'be notified fin or reset')
-                    self.sendto(self._encrypt(packet2bin(p)), self.address)
-                    break
-
-                if 0xffffffff <= packet.sequence:
-                    p = Packet(CONTROL_FIN, 0, 0, time(), b'sequence overflow')
+                    p = Packet(CONTROL_FIN, CycInt(0), 0, time(), b'be notified fin or reset')
                     self.sendto(self._encrypt(packet2bin(p)), self.address)
                     break
 
@@ -308,7 +341,7 @@ class SecureReliableSocket(socket):
                                 try:
                                     new_mtu = self.mtu_size * max(self.mtu_multiple - 1, 1)
                                     size = 16 * (new_mtu // 16 - 1) - packet_struct.size - 1
-                                    p = Packet(CONTROL_MTU, new_mtu, 0, time(), b'#' * size)
+                                    p = Packet(CONTROL_MTU, CycInt(new_mtu), 0, time(), b'#' * size)
                                     self.sendto(self._encrypt(packet2bin(p)), self.address)
                                 except s.error:
                                     pass  # Message too long
@@ -319,7 +352,7 @@ class SecureReliableSocket(socket):
                 if packet.control & CONTROL_MTU:
                     if len(packet.data) == 0:
                         # receive response: update to new MTU
-                        self.mtu_multiple = packet.sequence // self.mtu_size
+                        self.mtu_multiple = int(packet.sequence) // self.mtu_size
                     else:
                         # send response: success new MTU
                         p = Packet(CONTROL_MTU, packet.sequence, 0, time(), b'')
@@ -480,7 +513,7 @@ class SecureReliableSocket(socket):
         # window_size = self.get_window_size()
         # if window_size < len(data):
         #    raise ValueError("data is too big {}<{}".format(window_size, len(data)))
-        packet = Packet(CONTROL_BCT, 0, 0, time(), data)
+        packet = Packet(CONTROL_BCT, CycInt(0), 0, time(), data)
         with self.sender_buffer_lock:
             self.sendto(self._encrypt(packet2bin(packet)), self.address)
 
@@ -542,7 +575,7 @@ class SecureReliableSocket(socket):
 
     def close(self) -> None:
         if self.established:
-            p = Packet(CONTROL_FIN, 0, 0, time(), b'closed')
+            p = Packet(CONTROL_FIN, CycInt(0), 0, time(), b'closed')
             self.sendto(self._encrypt(packet2bin(p)), self.address)
             sleep(0.001)
             super().close()
