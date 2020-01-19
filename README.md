@@ -9,7 +9,7 @@ Features
 * Usage like normal socket object
 * Protocol similar to RUDP
 * UDP hole punching
-* high performance (8Mbps/s　Up&Down)
+* high performance (8Mbps/s Up&Down)
 * ipv4/ipv6
 
 Requirement
@@ -72,8 +72,8 @@ In other words, it has a connection state, guarantees data reachability, and is 
 
 Links
 ----
-* [Winnyの解説 -ポート0問題-](http://winny.4th.jp/lesson1/port.html)
-* [[24日目] NAT Traversalって知ってますか](https://tech-blog.cerevo.com/adventcalendar2016/advent24/)
+* [Winny -Port0 setting-](http://winny.4th.jp/lesson1/port.html)
+* [(24days) NAT Traversal](https://tech-blog.cerevo.com/adventcalendar2016/advent24/)
 * [Peer-to-Peer Communication Across Network Address Translators](https://bford.info/pub/net/p2pnat/)
 
 Author
