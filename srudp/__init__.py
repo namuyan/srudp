@@ -234,7 +234,7 @@ class SecureReliableSocket(socket):
                             transmit_limit -= 1
 
             # send ack as ping (stream may be free)
-            if self.mut_auto_fix and self.span < time() - last_ack_time:
+            if self.span < time() - last_ack_time:
                 p = Packet(CONTROL_ACK, self.receiver_seq - 1, 0, time(), b'as ping')
                 self.sendto(self._encrypt(packet2bin(p)), self.address)
                 last_ack_time = time()
@@ -352,6 +352,7 @@ class SecureReliableSocket(socket):
                             re_packet = Packet(CONTROL_RTM, p.sequence, p.retry+1, time(), b'')
                             retransmit_packets[i] = re_packet
                             self.sendto(self._encrypt(packet2bin(re_packet)), self.address)
+                            self.loss += 1
                             break
 
                 # receive data
@@ -369,6 +370,7 @@ class SecureReliableSocket(socket):
                         else:
                             re_packet = Packet(CONTROL_RTM, lost_sequence, 0, time(), b'')
                             self.sendto(self._encrypt(packet2bin(re_packet)), self.address)
+                            self.loss += 1
                             retransmit_packets.append(re_packet)
                     else:
                         pass  # do not do anything..
@@ -384,6 +386,7 @@ class SecureReliableSocket(socket):
                             re_packet = Packet(CONTROL_RTM, p.sequence, p.retry+1, time(), b'')
                             retransmit_packets[i] = re_packet
                             self.sendto(self._encrypt(packet2bin(re_packet)), self.address)
+                            self.loss += 1
 
                 # fix packet order & push buffer
                 if self.receiver_seq in temporary:
