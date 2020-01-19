@@ -72,7 +72,8 @@ def packet2bin(p: Packet):
 
 class SecureReliableSocket(socket):
     __slots__ = [
-        "timeout", "span", "address", "shared_key", "mtu_size", "mtu_multiple",
+        "timeout", "span", "address", "shared_key",
+        "mut_auto_fix", "mtu_size", "mtu_multiple",
         "sender_seq", "sender_buffer", "sender_signal", "sender_buffer_lock",
         "receiver_seq", "receiver_buffer", "receiver_signal", "receiver_buffer_lock",
         "loss", "established"]
@@ -84,6 +85,7 @@ class SecureReliableSocket(socket):
         self.span = span
         self.address = tuple()
         self.shared_key = b''
+        self.mut_auto_fix = False  # set automatic best MUT size
         self.mtu_size = 0  # 1472b
         self.mtu_multiple = 1  # 1 to 4096
         # sender params
@@ -232,7 +234,7 @@ class SecureReliableSocket(socket):
                             transmit_limit -= 1
 
             # send ack as ping (stream may be free)
-            if self.span < time() - last_ack_time:
+            if self.mut_auto_fix and self.span < time() - last_ack_time:
                 p = Packet(CONTROL_ACK, self.receiver_seq - 1, 0, time(), b'as ping')
                 self.sendto(self._encrypt(packet2bin(p)), self.address)
                 last_ack_time = time()
@@ -244,7 +246,7 @@ class SecureReliableSocket(socket):
                 break
 
             # fix MTU size more bigger
-            if self.timeout < time() - last_mtu_fix_time:
+            if self.mut_auto_fix and self.timeout < time() - last_mtu_fix_time:
                 try:
                     new_mtu = self.mtu_size * min(self.mtu_multiple + 1, 4096)
                     size = 16 * (new_mtu // 16 - 1) - packet_struct.size - 1
@@ -302,7 +304,7 @@ class SecureReliableSocket(socket):
                     if self.span < time() - last_mtu_fix_time:
                         if 1 < len(retransmitted):
                             ave = (time() - retransmitted[0]) / len(retransmitted)
-                            if ave < self.timeout:
+                            if 1 < self.mtu_multiple and ave < self.timeout:
                                 try:
                                     new_mtu = self.mtu_size * max(self.mtu_multiple - 1, 1)
                                     size = 16 * (new_mtu // 16 - 1) - packet_struct.size - 1
