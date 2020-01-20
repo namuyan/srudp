@@ -42,6 +42,12 @@ SEND_BUFFER_SIZE = WINDOW_MAX_SIZE * 8  # 256kb
 MAX_RETRANSMIT_LIMIT = 4
 FULL_SIZE_PACKET_WAIT = 0.001  # sec
 
+# Path MTU Discovery
+IP_MTU = 14
+IP_MTU_DISCOVER = 10
+IP_PMTUDISC_DONT = 0
+IP_PMTUDISC_DO = 2
+
 
 class CycInt(int):
     """
@@ -208,8 +214,12 @@ class SecureReliableSocket(socket):
             # cannot establish
             raise ConnectionError("timeout on hand shaking")
 
-        # setup full mtu
+        # get best MUT size
+        # set don't-fragment flag & reset after
+        # avoid Path MTU Discovery Blackhole
+        self.setsockopt(s.IPPROTO_IP, IP_MTU_DISCOVER, IP_PMTUDISC_DO)
         self.mtu_size = self._find_mut_size()
+        self.setsockopt(s.IPPROTO_IP, IP_MTU_DISCOVER, IP_PMTUDISC_DONT)
         log.debug("success get MUT size %db", self.mtu_size)
 
         # success establish connection
@@ -593,7 +603,6 @@ class SecureReliableSocket(socket):
 
 def get_mtu_linux(family, host) -> int:
     """MTU on Linux"""
-    IP_MTU_DISCOVER, IP_PMTUDISC_DO, IP_MTU = 10, 2, 14
     with socket(family, s.SOCK_DGRAM) as sock:
         sock.connect((host, 0))
         if family == s.AF_INET:
