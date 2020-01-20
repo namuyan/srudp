@@ -80,6 +80,14 @@ class CycInt(int):
             return True
         return self.__lt__(other)
 
+    def __ge__(self, other: int) -> bool:
+        """self>=value"""
+        return not self.__lt__(other)
+
+    def __gt__(self, other: int) -> bool:
+        """self>value"""
+        return not self.__le__(other)
+
 
 class Packet(NamedTuple):
     """
