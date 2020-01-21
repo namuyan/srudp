@@ -175,10 +175,8 @@ class SecureReliableSocket(socket):
         for _ in range(int(self.timeout / self.span)):
             r, _w, _x = select([self], [], [], self.span)
             if r:
-                data, addr = self.recvfrom(1024)
-                if addr != address:
-                    raise ConnectionError("unknown try to connect {}".format(addr))
-                elif data.startswith(punch_msg):
+                data, _addr = self.recvfrom(1024)
+                if data.startswith(punch_msg):
                     # 2. send my public key
                     self.sendto(my_pk.to_string(), address)
                     log.debug("success UDP hole punching")
@@ -317,6 +315,11 @@ class SecureReliableSocket(socket):
                 data, _addr = self.recvfrom(65536)
                 try:
                     packet = bin2packet(self._decrypt(data))
+
+                    # reject too early or late packet
+                    if 3600.0 < abs(time() - packet.time):
+                        continue
+
                     last_receive_time = time()
                     # log.debug("r<< %s", packet)
                 except ValueError:
