@@ -122,6 +122,15 @@ def packet2bin(p: Packet):
     return packet_struct.pack(p.control, int(p.sequence), p.retry, p.time) + p.data
 
 
+def get_formal_address_format(address: tuple, family: int) -> tuple:
+    """tuple of ipv4/6 correct address format"""
+    for _, _, _, _, addr in s.getaddrinfo(str(address[0]), int(address[1]), family, s.SOCK_STREAM):
+        # domain name resolve
+        return addr
+    else:
+        raise Exception("not found correct ip format of {}".format(address))
+
+
 class SecureReliableSocket(socket):
     __slots__ = [
         "timeout", "span", "address", "shared_key",
@@ -157,7 +166,7 @@ class SecureReliableSocket(socket):
     def connect(self, address: tuple) -> None:
         """UDP hole punching & get shared key"""
         assert not self.established, "already established"
-        self.address = address
+        self.address = address = get_formal_address_format(address, self.family)
         address_copy = list(address)
         address_copy[0] = ""  # bind global address
         self.bind(tuple(address_copy))
@@ -669,6 +678,9 @@ if __name__ == '__main__':
 
 __all__ = [
     "Packet",
+    "bin2packet",
+    "packet2bin",
+    "get_formal_address_format",
     "SecureReliableSocket",
     "get_mtu_linux",
 ]
