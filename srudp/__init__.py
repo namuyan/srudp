@@ -224,9 +224,11 @@ class SecureReliableSocket(socket):
         # get best MUT size
         # set don't-fragment flag & reset after
         # avoid Path MTU Discovery Blackhole
-        self.setsockopt(s.IPPROTO_IP, IP_MTU_DISCOVER, IP_PMTUDISC_DO)
+        if self.family == s.AF_INET:
+            self.setsockopt(s.IPPROTO_IP, IP_MTU_DISCOVER, IP_PMTUDISC_DO)
         self.mtu_size = self._find_mut_size()
-        self.setsockopt(s.IPPROTO_IP, IP_MTU_DISCOVER, IP_PMTUDISC_DONT)
+        if self.family == s.AF_INET:
+            self.setsockopt(s.IPPROTO_IP, IP_MTU_DISCOVER, IP_PMTUDISC_DONT)
         log.debug("success get MUT size %db", self.mtu_size)
 
         # success establish connection
