@@ -5,7 +5,6 @@ from collections import deque
 from hashlib import sha256
 from Cryptodome.Cipher import AES
 from Cryptodome.Util.Padding import pad, unpad
-from Cryptodome import Random
 from struct import Struct
 from io import BytesIO, SEEK_END
 from socket import socket
@@ -122,13 +121,14 @@ def packet2bin(p: Packet):
     return packet_struct.pack(p.control, int(p.sequence), p.retry, p.time) + p.data
 
 
-def get_formal_address_format(address: tuple, family: int) -> tuple:
+def get_formal_address_format(address: tuple, family=s.AF_INET) -> tuple:
     """tuple of ipv4/6 correct address format"""
+    assert isinstance(address, tuple)
     for _, _, _, _, addr in s.getaddrinfo(str(address[0]), int(address[1]), family, s.SOCK_STREAM):
         # domain name resolve
         return addr
     else:
-        raise Exception("not found correct ip format of {}".format(address))
+        raise ConnectionError("not found correct ip format of {}".format(address))
 
 
 class SecureReliableSocket(socket):
@@ -140,6 +140,11 @@ class SecureReliableSocket(socket):
         "loss", "established"]
 
     def __init__(self, family=s.AF_INET, timeout=21.0, span=3.0):
+        """
+        :param family: socket type AF_INET or AF_INET6
+        :param timeout: auto socket close by the time passed (sec)
+        :param span: check socket status by the span (sec)
+        """
         super().__init__(family, s.SOCK_DGRAM)
         # inner params
         self.timeout = timeout
@@ -280,6 +285,7 @@ class SecureReliableSocket(socket):
         last_receive_time = time()
         last_ack_time = time()
         last_mtu_fix_time = time()
+
         while not self.is_closed:
             r, _w, _x = select([self], [], [], self.span)
 
@@ -498,6 +504,7 @@ class SecureReliableSocket(socket):
         return 16 * (self.mtu_size * self.mtu_multiple // 16 - 1) - packet_struct.size - 1
 
     def send(self, data: memoryview, flags=0) -> int:
+        """warning: row-level method"""
         if not self.established:
             raise ConnectionAbortedError('disconnected')
         # decrease 1byte for padding of AES when packet is full size
@@ -527,7 +534,9 @@ class SecureReliableSocket(socket):
                 break
         return send_size
 
-    def sendall(self, data: Union[bytes, memoryview], flag=0) -> None:
+    def sendall(self, data: Union[bytes, memoryview], flags=0) -> None:
+        """high-level method, use this instead of send()"""
+        assert flags == 0, "flags are disabled"
         if not self._send_buffer_is_full():
             self.sender_signal.set()
         send_size = 0
@@ -584,7 +593,7 @@ class SecureReliableSocket(socket):
     def _encrypt(self, data: bytes) -> bytes:
         assert len(self.shared_key) == 32, "wrong shared key"
         raw = pad(data, AES.block_size)
-        iv = Random.new().read(AES.block_size)
+        iv = os.urandom(AES.block_size)
         cipher = AES.new(self.shared_key, AES.MODE_CBC, iv)
         return iv + cipher.encrypt(raw)
 
@@ -652,7 +661,7 @@ def main():
             if len(r) == 0:
                 break
             if b'find me!' in r:
-                log.debug("find you!!! (%s)", r.decode())
+                log.debug("find you!!! (%s)", r)
                 continue
             if 0 <= r.find(b'start!'):
                 size, start = 0, time()
