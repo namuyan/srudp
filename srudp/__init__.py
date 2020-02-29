@@ -3,6 +3,7 @@ from select import select
 from time import sleep, time
 from collections import deque
 from hashlib import sha256
+from binascii import a2b_hex
 from Cryptodome.Cipher import AES
 from Cryptodome.Util.Padding import pad, unpad
 from struct import Struct
@@ -183,6 +184,7 @@ class SecureReliableSocket(socket):
         self.bind(tuple(address_copy))
         log.debug("try to communicate with {}".format(address))
 
+        # warning: allow only 256bit curve
         select_curve = ecdsa.curves.NIST256p
         log.debug("select curve {} (static)".format(select_curve))
 
@@ -190,9 +192,8 @@ class SecureReliableSocket(socket):
         punch_msg = b"udp hole punching"
         self.sendto(S_HOLE_PUNCHING + punch_msg + select_curve.name.encode(), address)
 
-        # generate key pair
-        my_sk = ecdsa.SigningKey.generate(select_curve)
-        my_pk = my_sk.get_verifying_key()
+        # my secret key
+        my_sk: Optional[ecdsa.SigningKey] = None
 
         check_msg = b"success hand shake"
         for _ in range(int(self.timeout / self.span)):
@@ -204,33 +205,36 @@ class SecureReliableSocket(socket):
                 if stage == S_HOLE_PUNCHING:
                     # 2. send my public key
                     curve_name = data.replace(punch_msg, b'').decode()
-                    for curve in ecdsa.curves.curves:
-                        if curve.name == curve_name:
-                            break
-                    else:
-                        raise ConnectionError("unknown curve {}".format(curve_name))
-                    if curve is not select_curve:
-                        raise ConnectionError("do not match curve {}".format(curve))
+                    select_curve = find_ecdhe_curve(curve_name)
+                    # update curve
+                    my_sk = ecdsa.SigningKey.generate(select_curve)
+                    my_pk = my_sk.get_verifying_key()
                     self.sendto(S_SEND_PUBLIC_KEY + my_pk.to_string(), address)
                     log.debug("success UDP hole punching")
 
                 elif stage == S_SEND_PUBLIC_KEY:
                     # 3. get public key & send shared key
                     other_pk = ecdsa.VerifyingKey.from_string(data, select_curve)
+                    # using my select curve
+                    my_sk = ecdsa.SigningKey.generate(select_curve)
+                    my_pk = my_sk.get_verifying_key()
                     shared_point = my_sk.privkey.secret_multiplier * other_pk.pubkey.point
                     self.shared_key = sha256(shared_point.x().to_bytes(32, 'big')).digest()
                     shared_key = os.urandom(32)
-                    encrypted_data = my_pk.to_string() + self._encrypt(shared_key)
+                    encrypted_data = my_pk.to_string().hex() + "+" + self._encrypt(shared_key).hex()
                     self.shared_key = shared_key
-                    self.sendto(S_SEND_SHARED_KEY + encrypted_data, address)
+                    self.sendto(S_SEND_SHARED_KEY + encrypted_data.encode(), address)
                     log.debug("success getting shared key")
 
                 elif stage == S_SEND_SHARED_KEY:
                     # 4. decrypt shared key & send hello msg
-                    other_pk = ecdsa.VerifyingKey.from_string(data[0:64], select_curve)
+                    encrypted_data = data.decode().split("+")
+                    other_pk = ecdsa.VerifyingKey.from_string(a2b_hex(encrypted_data[0]), select_curve)
+                    if my_sk is None:
+                        raise ConnectionError("not found my_sk")
                     shared_point = my_sk.privkey.secret_multiplier * other_pk.pubkey.point
                     self.shared_key = sha256(shared_point.x().to_bytes(32, 'big')).digest()
-                    self.shared_key = self._decrypt(data[64:64 + 64])
+                    self.shared_key = self._decrypt(a2b_hex(encrypted_data[1]))
                     self.sendto(S_ESTABLISHED + self._encrypt(check_msg), address)
                     log.debug("success decrypt shared key")
                     break
@@ -645,6 +649,14 @@ class SecureReliableSocket(socket):
             super().close()
             self.established = False
             self.receiver_signal.set()
+
+
+def find_ecdhe_curve(curve_name):
+    for curve in ecdsa.curves.curves:
+        if curve.name == curve_name:
+            return curve
+    else:
+        raise ConnectionError("unknown curve {}".format(curve_name))
 
 
 def get_mtu_linux(family, host) -> int:
