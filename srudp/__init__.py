@@ -356,8 +356,8 @@ class SecureReliableSocket(socket):
 
             # received packet
             if r:
-                data, _addr = self.recvfrom(65536)
                 try:
+                    data, _addr = self.recvfrom(65536)
                     packet = bin2packet(self._decrypt(data))
 
                     # reject too early or late packet
@@ -369,6 +369,11 @@ class SecureReliableSocket(socket):
                 except ValueError:
                     # log.debug("decrypt failed len=%s..".format(data[:10]))
                     continue
+                except (ConnectionResetError, OSError):
+                    break
+                except Exception:
+                    log.error("UDP socket closed", exc_info=True)
+                    break
 
                 # receive ack
                 if packet.control & CONTROL_ACK:
