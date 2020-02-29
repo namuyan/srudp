@@ -47,6 +47,12 @@ IP_MTU_DISCOVER = 10
 IP_PMTUDISC_DONT = 0
 IP_PMTUDISC_DO = 2
 
+# connection stage
+S_HOLE_PUNCHING = b'\x00'
+S_SEND_PUBLIC_KEY = b'\x01'
+S_SEND_SHARED_KEY = b'\x02'
+S_ESTABLISHED = b'\x03'
+
 
 class CycInt(int):
     """
@@ -177,12 +183,15 @@ class SecureReliableSocket(socket):
         self.bind(tuple(address_copy))
         log.debug("try to communicate with {}".format(address))
 
+        select_curve = ecdsa.curves.NIST256p
+        log.debug("select curve {} (static)".format(select_curve))
+
         # 1. UDP hole punching
         punch_msg = b"udp hole punching"
-        self.sendto(punch_msg, address)
+        self.sendto(S_HOLE_PUNCHING + punch_msg + select_curve.name.encode(), address)
 
         # generate key pair
-        my_sk = ecdsa.SigningKey.generate(ecdsa.curves.NIST256p)
+        my_sk = ecdsa.SigningKey.generate(select_curve)
         my_pk = my_sk.get_verifying_key()
 
         check_msg = b"success hand shake"
@@ -190,36 +199,50 @@ class SecureReliableSocket(socket):
             r, _w, _x = select([self], [], [], self.span)
             if r:
                 data, _addr = self.recvfrom(1024)
-                if data.startswith(punch_msg):
+                stage, data = data[:1], data[1:]
+
+                if stage == S_HOLE_PUNCHING:
                     # 2. send my public key
-                    self.sendto(my_pk.to_string(), address)
+                    curve_name = data.replace(punch_msg, b'').decode()
+                    for curve in ecdsa.curves.curves:
+                        if curve.name == curve_name:
+                            break
+                    else:
+                        raise ConnectionError("unknown curve {}".format(curve_name))
+                    if curve is not select_curve:
+                        raise ConnectionError("do not match curve {}".format(curve))
+                    self.sendto(S_SEND_PUBLIC_KEY + my_pk.to_string(), address)
                     log.debug("success UDP hole punching")
-                elif len(data) == 64:
+
+                elif stage == S_SEND_PUBLIC_KEY:
                     # 3. get public key & send shared key
-                    other_pk = ecdsa.VerifyingKey.from_string(data, ecdsa.curves.NIST256p)
+                    other_pk = ecdsa.VerifyingKey.from_string(data, select_curve)
                     shared_point = my_sk.privkey.secret_multiplier * other_pk.pubkey.point
                     self.shared_key = sha256(shared_point.x().to_bytes(32, 'big')).digest()
                     shared_key = os.urandom(32)
                     encrypted_data = my_pk.to_string() + self._encrypt(shared_key)
                     self.shared_key = shared_key
-                    self.sendto(encrypted_data, address)
+                    self.sendto(S_SEND_SHARED_KEY + encrypted_data, address)
                     log.debug("success getting shared key")
-                elif len(data) == 64 + 64:
+
+                elif stage == S_SEND_SHARED_KEY:
                     # 4. decrypt shared key & send hello msg
-                    other_pk = ecdsa.VerifyingKey.from_string(data[0:64], ecdsa.curves.NIST256p)
+                    other_pk = ecdsa.VerifyingKey.from_string(data[0:64], select_curve)
                     shared_point = my_sk.privkey.secret_multiplier * other_pk.pubkey.point
                     self.shared_key = sha256(shared_point.x().to_bytes(32, 'big')).digest()
                     self.shared_key = self._decrypt(data[64:64 + 64])
-                    self.sendto(self._encrypt(check_msg), address)
-                    log.debug("success decrypt common key")
+                    self.sendto(S_ESTABLISHED + self._encrypt(check_msg), address)
+                    log.debug("success decrypt shared key")
                     break
-                elif len(data) == 48:
-                    # 5. check decrypt message
+
+                elif stage == S_ESTABLISHED:
+                    # 5. check establish by decrypt specific message
                     decrypt_msg = self._decrypt(data)
                     if decrypt_msg != check_msg:
                         raise ConnectionError("failed to check")
                     log.debug("success hand shaking")
                     break
+
                 else:
                     raise ConnectionError("not defined message received {}len".format(len(data)))
         else:
