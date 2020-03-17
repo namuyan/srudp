@@ -533,7 +533,7 @@ class SecureReliableSocket(socket):
 
     def get_window_size(self) -> int:
         """maximum size of data you can send at once"""
-        return 16 * (self.mtu_size * self.mtu_multiple // 16 - 1) - packet_struct.size - 1
+        return self.mtu_size * self.mtu_multiple - 32 - packet_struct.size
 
     def send(self, data: memoryview, flags=0) -> int:
         """warning: row-level method"""
@@ -623,21 +623,16 @@ class SecureReliableSocket(socket):
         return b''
 
     def _encrypt(self, data: bytes) -> bytes:
-        assert len(self.shared_key) == 32, "wrong shared key"
-        raw = pad(data, AES.block_size)
-        iv = os.urandom(AES.block_size)
-        cipher = AES.new(self.shared_key, AES.MODE_CBC, iv)
-        return iv + cipher.encrypt(raw)
+        cipher = AES.new(self.shared_key, AES.MODE_GCM)
+        # warning: Don't reuse nonce
+        enc, tag = cipher.encrypt_and_digest(data)
+        # length = 16bytes + 16bytes + N(=data)bytes
+        return cipher.nonce + tag + enc
 
     def _decrypt(self, data: bytes) -> bytes:
-        assert len(self.shared_key) == 32, "wrong shared key"
-        iv = data[:AES.block_size]
-        cipher = AES.new(self.shared_key, AES.MODE_CBC, iv)
-        raw = cipher.decrypt(data[AES.block_size:])
-        raw = unpad(raw, AES.block_size)
-        if len(raw) == 0:
-            raise ValueError("AES decryption failed")
-        return raw
+        cipher = AES.new(self.shared_key, AES.MODE_GCM, nonce=data[:16])
+        # ValueError raised when verify failed
+        return cipher.decrypt_and_verify(data[32:], data[16:32])
 
     @property
     def is_closed(self) -> bool:
