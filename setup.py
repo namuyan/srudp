@@ -21,7 +21,7 @@ except Exception:
 
 setup(
     name="srudp",
-    version="0.2.0",
+    version="0.3.0",
     url='https://github.com/namuyan/srudp',
     author='namuyan',
     description='Secure Reliable UDP',
