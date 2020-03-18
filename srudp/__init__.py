@@ -676,7 +676,7 @@ def get_mtu_linux(family, host) -> int:
 
 def main():
     """for test"""
-    import sys
+    import sys, random
     remote_host = sys.argv[1]
     port = int(sys.argv[2])
     msglen = int(sys.argv[3])
@@ -700,9 +700,6 @@ def main():
             r = sock.recv(8192)
             if len(r) == 0:
                 break
-            if b'find me!' in r:
-                log.debug("find you!!! (%s)", r)
-                continue
             if 0 <= r.find(b'start!'):
                 size, start = 0, time()
             size += len(r)
@@ -716,9 +713,15 @@ def main():
         while msglen:
             sock.sendall(b'start!'+os.urandom(msglen)+b'success!')  # +14
             log.debug("send now! loss=%d time=%d", sock.loss, int(time()))
-            sock.broadcast(b'find me! ' + str(time()).encode())
+            if 0 == random.randint(0, 5):
+                sock.broadcast(b'find me! ' + str(time()).encode())
+                log.debug("send broadcast!")
             sleep(20)
 
+    def broadcast_hook(packet: Packet):
+        log.debug("find you!!! (%s)", packet)
+
+    sock.broadcast_hook_fnc = broadcast_hook
     threading.Thread(target=listen).start()
     threading.Thread(target=sending).start()
 
