@@ -21,10 +21,10 @@ except Exception:
 
 setup(
     name="srudp",
-    version="0.3.0",
+    version="0.3.1",
     url='https://github.com/namuyan/srudp',
     author='namuyan',
-    description='Secure Reliable UDP',
+    description='secure reliable udp socket implemented by PurePython',
     long_description=readme,
     long_description_content_type='text/markdown',
     packages=find_packages(),
