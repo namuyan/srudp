@@ -1,4 +1,5 @@
 from typing import NamedTuple, Optional, Union
+from types import FunctionType
 from select import select
 from time import sleep, time
 from collections import deque
@@ -144,7 +145,7 @@ class SecureReliableSocket(socket):
         "mut_auto_fix", "mtu_size", "mtu_multiple",
         "sender_seq", "sender_buffer", "sender_signal", "sender_buffer_lock",
         "receiver_seq", "receiver_buffer", "receiver_signal", "receiver_buffer_lock",
-        "loss", "established"]
+        "broadcast_hook_fnc", "loss", "established"]
 
     def __init__(self, family=s.AF_INET, timeout=21.0, span=3.0):
         """
@@ -171,6 +172,8 @@ class SecureReliableSocket(socket):
         self.receiver_buffer = BytesIO()
         self.receiver_signal = threading.Event()
         self.receiver_buffer_lock = threading.Lock()
+        # broadcast hook
+        self.broadcast_hook_fnc: Optional[FunctionType] = None
         # status
         self.loss = 0
         self.established = False
@@ -431,7 +434,9 @@ class SecureReliableSocket(socket):
 
                 # broadcast packet
                 if packet.control & CONTROL_BCT:
-                    if last_packet is None or last_packet.control & CONTROL_EOF:
+                    if self.broadcast_hook_fnc is not None:
+                        self.broadcast_hook_fnc(packet)
+                    elif last_packet is None or last_packet.control & CONTROL_EOF:
                         self._push_receive_buffer(packet.data)
                     else:
                         broadcast_packets.append(packet)
