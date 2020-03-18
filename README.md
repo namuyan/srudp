@@ -9,7 +9,7 @@ Features
 * Usage like normal socket object
 * Protocol similar to RUDP
 * UDP hole punching
-* high performance (8Mbps/s Up&Down)
+* high performance (4Mbps/s Up&Down when 10mb)
 * ipv4/ipv6
 
 Requirement

@@ -6,7 +6,6 @@ from collections import deque
 from hashlib import sha256
 from binascii import a2b_hex
 from Cryptodome.Cipher import AES
-from Cryptodome.Util.Padding import pad, unpad
 from struct import Struct
 from io import BytesIO, SEEK_END
 from socket import socket
@@ -38,7 +37,7 @@ FLAG_NAMES = {
     CONTROL_MTU: "MTU",
     CONTROL_FIN: "FIN",
 }
-WINDOW_MAX_SIZE = 32768
+WINDOW_MAX_SIZE = 32768  # 32kb
 SEND_BUFFER_SIZE = WINDOW_MAX_SIZE * 8  # 256kb
 MAX_RETRANSMIT_LIMIT = 4
 FULL_SIZE_PACKET_WAIT = 0.001  # sec
@@ -100,6 +99,10 @@ class CycInt(int):
     def __gt__(self, other: int) -> bool:
         """self>value"""
         return not self.__le__(other)
+
+
+# static cycle int
+CYC_INT0 = CycInt(0)
 
 
 class Packet(NamedTuple):
@@ -342,7 +345,7 @@ class SecureReliableSocket(socket):
 
             # connection may be broken
             if self.timeout < time() - last_receive_time:
-                p = Packet(CONTROL_FIN, CycInt(0), 0, time(), b'stream may be broken')
+                p = Packet(CONTROL_FIN, CYC_INT0, 0, time(), b'stream may be broken')
                 self.sendto(self._encrypt(packet2bin(p)), self.address)
                 break
 
@@ -392,7 +395,7 @@ class SecureReliableSocket(socket):
 
                 # receive reset
                 if packet.control & CONTROL_FIN:
-                    p = Packet(CONTROL_FIN, CycInt(0), 0, time(), b'be notified fin or reset')
+                    p = Packet(CONTROL_FIN, CYC_INT0, 0, time(), b'be notified fin or reset')
                     self.sendto(self._encrypt(packet2bin(p)), self.address)
                     break
 
@@ -591,7 +594,7 @@ class SecureReliableSocket(socket):
         # window_size = self.get_window_size()
         # if window_size < len(data):
         #    raise ValueError("data is too big {}<{}".format(window_size, len(data)))
-        packet = Packet(CONTROL_BCT, CycInt(0), 0, time(), data)
+        packet = Packet(CONTROL_BCT, CYC_INT0, 0, time(), data)
         with self.sender_buffer_lock:
             self.sendto(self._encrypt(packet2bin(packet)), self.address)
 
@@ -628,13 +631,15 @@ class SecureReliableSocket(socket):
         return b''
 
     def _encrypt(self, data: bytes) -> bytes:
+        """encrypt by AES-GCM (more secure than CBC mode)"""
         cipher = AES.new(self.shared_key, AES.MODE_GCM)
         # warning: Don't reuse nonce
         enc, tag = cipher.encrypt_and_digest(data)
-        # length = 16bytes + 16bytes + N(=data)bytes
+        # output length = 16bytes + 16bytes + N(=data)bytes
         return cipher.nonce + tag + enc
 
     def _decrypt(self, data: bytes) -> bytes:
+        """decrypt by AES-GCM (more secure than CBC mode)"""
         cipher = AES.new(self.shared_key, AES.MODE_GCM, nonce=data[:16])
         # ValueError raised when verify failed
         return cipher.decrypt_and_verify(data[32:], data[16:32])
@@ -648,7 +653,7 @@ class SecureReliableSocket(socket):
 
     def close(self) -> None:
         if self.established:
-            p = Packet(CONTROL_FIN, CycInt(0), 0, time(), b'closed')
+            p = Packet(CONTROL_FIN, CYC_INT0, 0, time(), b'closed')
             self.sendto(self._encrypt(packet2bin(p)), self.address)
             sleep(0.001)
             super().close()

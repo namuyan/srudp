@@ -30,11 +30,12 @@ setup(
     packages=find_packages(),
     install_requires=install_requires,
     license="MIT Licence",
-    keywords='RUDP UDP P2P',
+    keywords='RUDP UDP P2P hole-punching',
     classifiers=[
         'Programming Language :: Python :: 3.5',
         'Programming Language :: Python :: 3.6',
         'Programming Language :: Python :: 3.7',
+        'Programming Language :: Python :: 3.8',
         'License :: OSI Approved :: MIT License',
     ],
 )
