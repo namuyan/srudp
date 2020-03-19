@@ -1,25 +1,35 @@
-os:
-  - linux
-  - windows
-  - osx
-
 # Disable sudo to speed up the build
 sudo: false
 
 # Set the build language to Python
 language: python
 
-# Set the python version
-python:
-  - "3.6"
-  - "3.7"
-  - "3.8"
+jobs:
+  include:
+    - name: "Python 3.6-3.8 on Xenial Linux"
+      os: linux
+      python:               # this works for Linux but is ignored on macOS or Windows
+        - "3.6"
+        - "3.7"
+        - "3.8"
+    - name: "Python 3.7.4 on macOS"
+      os: osx
+      osx_image: xcode11.2  # Python 3.7.4 running on macOS 10.14.4
+      language: shell       # 'language: python' is an error on Travis CI macOS
+    - name: "Python 3.8.0 on Windows"
+      os: windows           # Windows 10.0.17134 N/A Build 17134
+      language: shell       # 'language: python' is an error on Travis CI Windows
+      before_install:
+        - python -m pip install --upgrade pip
+      env: PATH=/c/Python38:/c/Python38/Scripts:$PATH
 
-# Install the codecov pip dependency
+# all three OSes agree about 'pip3'
 install:
-  - pip install -r requirements.txt
-  - pip install mypy
+  - pip3 install --upgrade pip
+  - pip3 install -r requirements.txt
+  - pip3 install mypy
 
-# Run the unit test
+# 'python' points to Python 2.7 on macOS but points to Python 3.8 on Linux and Windows
+# 'python3' is a 'command not found' error on Windows but 'py' works on Windows only
 script:
-  - python -m mypy --allow-redefinition --ignore-missing-imports --disallow-untyped-defs --warn-redundant-casts --no-implicit-optional srudp
+  - python3 -m mypy --allow-redefinition --ignore-missing-imports --disallow-untyped-defs --warn-redundant-casts --no-implicit-optional srudp || python -m mypy --allow-redefinition --ignore-missing-imports --disallow-untyped-defs --warn-redundant-casts --no-implicit-optional srudp
