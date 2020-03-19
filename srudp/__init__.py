@@ -165,8 +165,8 @@ class SecureReliableSocket(socket):
         # inner params
         self.timeout = timeout
         self.span = span
-        self._address: Optional[_Address] = None
-        self.shared_key = b''
+        self.address: _Address = None
+        self.shared_key: bytes = None
         self.mut_auto_fix = False  # set automatic best MUT size
         self.mtu_size = 0  # 1472b
         self.mtu_multiple = 1  # 1 to 4096
@@ -189,7 +189,7 @@ class SecureReliableSocket(socket):
     def connect(self, address: _WildAddress) -> None:
         """UDP hole punching & get shared key"""
         assert not self.established, "already established"
-        self._address = address = get_formal_address_format(address, self.family)
+        self.address = address = get_formal_address_format(address, self.family)
         address_copy = list(address)
         address_copy[0] = ""  # bind global address
         self.bind(tuple(address_copy))
@@ -280,12 +280,6 @@ class SecureReliableSocket(socket):
 
         # auto exit when program closed
         atexit.register(self.close)
-
-    @property
-    def address(self) -> _Address:
-        if self._address is None:
-            raise ConnectionError("address is undefined")
-        return self._address
 
     def _find_mut_size(self) -> int:
         """confirm by submit real packet"""
@@ -557,8 +551,11 @@ class SecureReliableSocket(socket):
         """maximum size of data you can send at once"""
         return self.mtu_size * self.mtu_multiple - 32 - packet_struct.size
 
-    def send(self, data: bytes, flags: int = ...) -> int:
-        raise NotImplementedError("do not use send() method")
+    def send(self, data: bytes, flags: int = 0) -> int:
+        """over write low-level method for compatibility"""
+        assert flags == 0, "unrecognized flags"
+        self.sendall(data)
+        return len(data)
 
     def _send(self, data: memoryview) -> int:
         """warning: row-level method"""

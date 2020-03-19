@@ -4,4 +4,5 @@ mypy^
     --disallow-untyped-defs^
     --warn-redundant-casts^
     --no-implicit-optional^
+    --no-strict-optional^
     srudp
