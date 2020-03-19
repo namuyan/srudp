@@ -12,6 +12,7 @@ from socket import socket
 import socket as s
 import threading
 import logging
+import atexit
 import ecdsa
 import os
 
@@ -272,6 +273,9 @@ class SecureReliableSocket(socket):
         # success establish connection
         threading.Thread(target=self._backend, daemon=True).start()
         self.established = True
+
+        # auto exit when program closed
+        atexit.register(self.close)
 
     def _find_mut_size(self) -> int:
         """confirm by submit real packet"""
@@ -648,6 +652,7 @@ class SecureReliableSocket(socket):
     def is_closed(self) -> bool:
         if self.fileno() == -1:
             self.established = False
+            atexit.unregister(self.close)
             return True
         return False
 
@@ -658,6 +663,7 @@ class SecureReliableSocket(socket):
             sleep(0.001)
             super().close()
             self.established = False
+            atexit.unregister(self.close)
             self.receiver_signal.set()
 
 
