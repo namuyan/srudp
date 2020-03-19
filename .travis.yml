@@ -1,3 +1,8 @@
+os:
+  - linux
+  - windows
+  - osx
+
 # Disable sudo to speed up the build
 sudo: false
 
