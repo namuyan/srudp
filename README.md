@@ -14,7 +14,7 @@ Features
 
 Requirement
 ----
-* Python**3.5+**
+* Python**3.6+**
 * [requirements.txt](requirements.txt)
 
 Installation

@@ -1,11 +1,11 @@
-from typing import NamedTuple, Optional, Union
-from types import FunctionType
+from typing import NamedTuple, Optional, Union, Deque, Tuple, Callable, Any
 from select import select
 from time import sleep, time
 from collections import deque
 from hashlib import sha256
 from binascii import a2b_hex
 from Cryptodome.Cipher import AES
+from Cryptodome.Cipher._mode_gcm import GcmMode
 from struct import Struct
 from io import BytesIO, SEEK_END
 from socket import socket
@@ -54,6 +54,11 @@ S_HOLE_PUNCHING = b'\x00'
 S_SEND_PUBLIC_KEY = b'\x01'
 S_SEND_SHARED_KEY = b'\x02'
 S_ESTABLISHED = b'\x03'
+
+# typing
+_Address = Tuple[Any, ...]
+_WildAddress = Union[_Address, str, bytes]
+_BroadcastHook = Callable[['Packet'], None]
 
 
 class CycInt(int):
@@ -117,27 +122,26 @@ class Packet(NamedTuple):
     time: float  # unix time (double)
     data: bytes  # data body
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return "Packet({} seq:{} retry:{} time:{} data:{}b)".format(
             FLAG_NAMES.get(self.control), self.sequence,
             self.retry, round(self.time, 2), len(self.data))
 
 
-def bin2packet(b: bytes):
+def bin2packet(b: bytes) -> 'Packet':
     c, seq, r, t = packet_struct.unpack_from(b)
     return Packet(c, CycInt(seq), r, t, b[packet_struct.size:])
 
 
-def packet2bin(p: Packet):
+def packet2bin(p: Packet) -> bytes:
     # log.debug("s>> %s", p)
     return packet_struct.pack(p.control, int(p.sequence), p.retry, p.time) + p.data
 
 
-def get_formal_address_format(address: tuple, family=s.AF_INET) -> tuple:
+def get_formal_address_format(address: _WildAddress, family: int = s.AF_INET) -> _Address:
     """tuple of ipv4/6 correct address format"""
-    assert isinstance(address, tuple)
+    assert isinstance(address, tuple), "cannot recognize bytes or str format"
     for _, _, _, _, addr in s.getaddrinfo(str(address[0]), int(address[1]), family, s.SOCK_STREAM):
-        # domain name resolve
         return addr
     else:
         raise ConnectionError("not found correct ip format of {}".format(address))
@@ -151,7 +155,7 @@ class SecureReliableSocket(socket):
         "receiver_seq", "receiver_buffer", "receiver_signal", "receiver_buffer_lock",
         "broadcast_hook_fnc", "loss", "established"]
 
-    def __init__(self, family=s.AF_INET, timeout=21.0, span=3.0):
+    def __init__(self, family: int = s.AF_INET, timeout: float = 21.0, span: float = 3.0) -> None:
         """
         :param family: socket type AF_INET or AF_INET6
         :param timeout: auto socket close by the time passed (sec)
@@ -161,14 +165,14 @@ class SecureReliableSocket(socket):
         # inner params
         self.timeout = timeout
         self.span = span
-        self.address = tuple()
-        self.shared_key = b''
+        self.address: _Address = None
+        self.shared_key: bytes = None
         self.mut_auto_fix = False  # set automatic best MUT size
         self.mtu_size = 0  # 1472b
         self.mtu_multiple = 1  # 1 to 4096
         # sender params
         self.sender_seq = CycInt(1)  # next send sequence
-        self.sender_buffer = deque()
+        self.sender_buffer: Deque[Packet] = deque()
         self.sender_signal = threading.Event()  # clear when buffer is empty
         self.sender_buffer_lock = threading.Lock()
         # receiver params
@@ -177,12 +181,12 @@ class SecureReliableSocket(socket):
         self.receiver_signal = threading.Event()
         self.receiver_buffer_lock = threading.Lock()
         # broadcast hook
-        self.broadcast_hook_fnc: Optional[FunctionType] = None
+        self.broadcast_hook_fnc: Optional[_BroadcastHook] = None
         # status
         self.loss = 0
         self.established = False
 
-    def connect(self, address: tuple) -> None:
+    def connect(self, address: _WildAddress) -> None:
         """UDP hole punching & get shared key"""
         assert not self.established, "already established"
         self.address = address = get_formal_address_format(address, self.family)
@@ -315,9 +319,9 @@ class SecureReliableSocket(socket):
     def _backend(self) -> None:
         """reorder sequence & fill output buffer"""
         temporary = dict()
-        retransmit_packets = deque()
-        retransmitted = deque(maxlen=16)
-        broadcast_packets = deque(maxlen=16)
+        retransmit_packets: Deque[Packet] = deque()
+        retransmitted: Deque[float] = deque(maxlen=16)
+        broadcast_packets: Deque[Packet] = deque(maxlen=16)
         last_packet: Optional[Packet] = None
         last_receive_time = time()
         last_ack_time = time()
@@ -531,7 +535,7 @@ class SecureReliableSocket(socket):
         # close
         self.close()
 
-    def _push_receive_buffer(self, data: bytes):
+    def _push_receive_buffer(self, data: bytes) -> None:
         """just append new data to buffer"""
         with self.receiver_buffer_lock:
             pos = self.receiver_buffer.tell()
@@ -547,7 +551,13 @@ class SecureReliableSocket(socket):
         """maximum size of data you can send at once"""
         return self.mtu_size * self.mtu_multiple - 32 - packet_struct.size
 
-    def send(self, data: memoryview, flags=0) -> int:
+    def send(self, data: bytes, flags: int = 0) -> int:
+        """over write low-level method for compatibility"""
+        assert flags == 0, "unrecognized flags"
+        self.sendall(data)
+        return len(data)
+
+    def _send(self, data: memoryview) -> int:
         """warning: row-level method"""
         if not self.established:
             raise ConnectionAbortedError('disconnected')
@@ -578,17 +588,16 @@ class SecureReliableSocket(socket):
                 break
         return send_size
 
-    def sendall(self, data: Union[bytes, memoryview], flags=0) -> None:
+    def sendall(self, data: bytes, flags: int = 0) -> None:
         """high-level method, use this instead of send()"""
-        assert flags == 0, "flags are disabled"
+        assert flags == 0, "unrecognized flags"
         if not self._send_buffer_is_full():
             self.sender_signal.set()
         send_size = 0
-        if isinstance(data, bytes):
-            data = memoryview(data)
+        data = memoryview(data)
         while send_size < len(data):
             if self.sender_signal.wait(self.timeout):
-                send_size += self.send(data[send_size:])
+                send_size += self._send(data[send_size:])
 
     def broadcast(self, data: bytes) -> None:
         """broadcast data (do not check reach)"""
@@ -602,8 +611,8 @@ class SecureReliableSocket(socket):
         with self.sender_buffer_lock:
             self.sendto(self._encrypt(packet2bin(packet)), self.address)
 
-    def recv(self, buflen=1024, flags=0) -> bytes:
-        assert flags == 0, "?"
+    def recv(self, buflen: int = 1024, flags: int = 0) -> bytes:
+        assert flags == 0, "unrecognized flags"
         timeout = self.gettimeout()
         while not self.is_closed:
             if not self.established:
@@ -636,7 +645,7 @@ class SecureReliableSocket(socket):
 
     def _encrypt(self, data: bytes) -> bytes:
         """encrypt by AES-GCM (more secure than CBC mode)"""
-        cipher = AES.new(self.shared_key, AES.MODE_GCM)
+        cipher: 'GcmMode' = AES.new(self.shared_key, AES.MODE_GCM)  # type: ignore
         # warning: Don't reuse nonce
         enc, tag = cipher.encrypt_and_digest(data)
         # output length = 16bytes + 16bytes + N(=data)bytes
@@ -644,7 +653,7 @@ class SecureReliableSocket(socket):
 
     def _decrypt(self, data: bytes) -> bytes:
         """decrypt by AES-GCM (more secure than CBC mode)"""
-        cipher = AES.new(self.shared_key, AES.MODE_GCM, nonce=data[:16])
+        cipher: 'GcmMode' = AES.new(self.shared_key, AES.MODE_GCM, nonce=data[:16])  # type: ignore
         # ValueError raised when verify failed
         return cipher.decrypt_and_verify(data[32:], data[16:32])
 
@@ -667,7 +676,7 @@ class SecureReliableSocket(socket):
             self.receiver_signal.set()
 
 
-def find_ecdhe_curve(curve_name):
+def find_ecdhe_curve(curve_name: str) -> ecdsa.curves.Curve:
     for curve in ecdsa.curves.curves:
         if curve.name == curve_name:
             return curve
@@ -675,7 +684,7 @@ def find_ecdhe_curve(curve_name):
         raise ConnectionError("unknown curve {}".format(curve_name))
 
 
-def get_mtu_linux(family, host) -> int:
+def get_mtu_linux(family: int, host: str) -> int:
     """MTU on Linux"""
     with socket(family, s.SOCK_DGRAM) as sock:
         sock.connect((host, 0))
@@ -685,7 +694,7 @@ def get_mtu_linux(family, host) -> int:
         return sock.getsockopt(s.IPPROTO_IP, IP_MTU)
 
 
-def main():
+def main() -> None:
     """for test"""
     import sys, random
     remote_host = sys.argv[1]
@@ -705,7 +714,7 @@ def main():
     sock.connect((remote_host, port))
     log.debug("connect success! mtu=%d", sock.mtu_size)
 
-    def listen():
+    def listen() -> None:
         size, start = 0, time()
         while True:
             r = sock.recv(8192)
@@ -720,7 +729,7 @@ def main():
             # log.debug("recv %d %d", size, len(r))
         log.debug("closed receive")
 
-    def sending():
+    def sending() -> None:
         while msglen:
             sock.sendall(b'start!'+os.urandom(msglen)+b'success!')  # +14
             log.debug("send now! loss=%d time=%d", sock.loss, int(time()))
@@ -729,7 +738,7 @@ def main():
                 log.debug("send broadcast!")
             sleep(20)
 
-    def broadcast_hook(packet: Packet):
+    def broadcast_hook(packet: Packet) -> None:
         log.debug("find you!!! (%s)", packet)
 
     sock.broadcast_hook_fnc = broadcast_hook
