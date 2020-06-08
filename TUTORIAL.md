@@ -103,6 +103,74 @@ b'hello world?'
 >>> 
 ```
 
+advance stage 1, let's send big data
+----
+generate random 16Mb binary and send.
+```shell script
+>>> import os
+>>> from hashlib import sha256
+>>> data = os.urandom(1024*1024*16)
+>>> len(data)
+16777216
+>>> sha256(data).hexdigest()
+'f6232284969ef76ad4baccd7d808eeb3a05686e0320a8661bddfd549c949a708'
+>>> sock.sendall(data)
+```
+
+receive the data and check sha256. Be careful don't overflow buffer.
+```shell script
+>>> from hashlib import sha256
+>>> sock.settimeout(30.0)
+>>> data = b''
+>>> while True:
+        try:
+...         data += sock.recv(1024*1024*1024)
+...     except Exception as e:
+...         print("timeout", e)
+...         break
+...
+socket.timeout
+>>> len(data)
+16777216
+>>> sha256(data).hexdigest()
+'f6232284969ef76ad4baccd7d808eeb3a05686e0320a8661bddfd549c949a708'
+```
+You can send big data like TCP easily.
+
+You may loss same packets when big data sending,
+you can know your internet stability by `sock.loss`.
+```shell script
+>>> sock.loss / sock.receiver_seq * 100
+0.151597273548493
+```
+I just transmitted from home PC at Japan to VPS hosted on Slovakia.
+This too long distance make me lost 0.15% of all packet.
+
+advance stage 2, unreliable broadcast
+----
+You can send message like UDP, but you can't detect the data reached.
+It's good for P2P mesh network broadcasting, I think.
+
+Just broadcast short message.
+````shell script
+>>> sock.broadcast(b"why?")
+````
+
+And receive it.
+```shell script
+>>> sock.recv(1024)
+b'why?'
+```
+
+You can also hook the message like this.
+normal `sock.sendall` message go `sock.recv`, only broadcast message.
+You will have big latency when don't hook broadcast
+because normal data stream block broadcast to avoid confuse data.
+```shell script
+>>> sock.broadcast_hook_fnc = lambda p: print(p, ",", p.data)
+Packet(BCT seq:0 retry:0 time:1591543763.87 data:4b) , b'why?'
+```
+
 close socket
 ----
 close by `sock.close()` or **ctrl+C**.
@@ -127,3 +195,10 @@ or "not received" by network communication delay.
 2. And you may have question "how to justify connection timing?",
 the answer is "You need to setup **signaling server**".
 I leave a implementation of this to the users, please.
+
+recommend other challenge
+----
+* connect your home and VPS or your friend
+* windows and Linux
+* Ipv6 connection
+* implement signaling system

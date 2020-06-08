@@ -19,6 +19,7 @@ Requirement
 
 Installation
 ----
+[tutorial for users "cannot work on my condition"](TUTORIAL.md)
 ```bash
 pip3 install --user srudp
 ```
@@ -56,6 +57,17 @@ print("closed", sock)
 ```
 Another side, receive the message and show immediately.
 
+to avoid troubles
+----
+* Do not think **always success connection  establish**.
+Web-RTC detect UDP-hole-punching success, or use alternative way when failed, you need to implement it.
+* UDP (and some TCP) is often **blocked** on public network
+like airport free wifi and university local LAN etc.
+Addition to it, some router and network adapter sometimes block.
+* I designed this **simple TCP like socket object**.
+This don't have signaling function, haven't data specialized because
+I will use this as one of low-layer libraries for P2P.
+
 Note: Why make this?
 ----
 These days, PC is located in a local environment protected by NAT.
@@ -72,8 +84,8 @@ In other words, it has a connection state, guarantees data reachability, and is 
 
 Links
 ----
-* [tutorial for users "cannot work on my condition"](TUTORIAL.md)
 * [Winny -Port0 setting-](http://winny.4th.jp/lesson1/port.html)
+* [lean about WebRTC](https://qiita.com/mush/items/121e45fefed009b6ad5e)
 * [(24days) NAT Traversal](https://tech-blog.cerevo.com/adventcalendar2016/advent24/)
 * [Peer-to-Peer Communication Across Network Address Translators](https://bford.info/pub/net/p2pnat/)
 
