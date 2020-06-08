@@ -25,7 +25,7 @@ CONTROL_PSH = 0b00000010  # Push data immediately
 CONTROL_EOF = 0b00000100  # end of file
 CONTROL_BCT = 0b00001000  # broadcast
 CONTROL_RTM = 0b00010000  # ask retransmission
-CONTROL_MTU = 0b00100000  # fix MTU size
+# CONTROL_MTU = 0b00100000  # fix MTU size
 CONTROL_FIN = 0b01000000  # fin
 FLAG_NAMES = {
     0b00000000: "---",
@@ -35,7 +35,7 @@ FLAG_NAMES = {
     CONTROL_PSH | CONTROL_EOF: "PSH+EOF",
     CONTROL_BCT: "BCT",
     CONTROL_RTM: "RTM",
-    CONTROL_MTU: "MTU",
+    # CONTROL_MTU: "MTU",
     CONTROL_FIN: "FIN",
 }
 WINDOW_MAX_SIZE = 32768  # 32kb
@@ -149,8 +149,7 @@ def get_formal_address_format(address: _WildAddress, family: int = s.AF_INET) ->
 
 class SecureReliableSocket(socket):
     __slots__ = [
-        "timeout", "span", "address", "shared_key",
-        "mut_auto_fix", "mtu_size", "mtu_multiple",
+        "timeout", "span", "address", "shared_key", "mtu_size",
         "sender_seq", "sender_buffer", "sender_signal", "sender_buffer_lock",
         "receiver_seq", "receiver_buffer", "receiver_signal", "receiver_buffer_lock",
         "broadcast_hook_fnc", "loss", "established"]
@@ -167,9 +166,7 @@ class SecureReliableSocket(socket):
         self.span = span
         self.address: _Address = None
         self.shared_key: bytes = None
-        self.mut_auto_fix = False  # set automatic best MUT size
         self.mtu_size = 0  # 1472b
-        self.mtu_multiple = 1  # 1 to 4096
         # sender params
         self.sender_seq = CycInt(1)  # next send sequence
         self.sender_buffer: Deque[Packet] = deque()
@@ -325,7 +322,6 @@ class SecureReliableSocket(socket):
         last_packet: Optional[Packet] = None
         last_receive_time = time()
         last_ack_time = time()
-        last_mtu_fix_time = time()
 
         while not self.is_closed:
             r, _w, _x = select([self], [], [], self.span)
@@ -356,17 +352,6 @@ class SecureReliableSocket(socket):
                 p = Packet(CONTROL_FIN, CYC_INT0, 0, time(), b'stream may be broken')
                 self.sendto(self._encrypt(packet2bin(p)), self.address)
                 break
-
-            # fix MTU size more bigger
-            if self.mut_auto_fix and self.timeout < time() - last_mtu_fix_time:
-                try:
-                    new_mtu = self.mtu_size * min(self.mtu_multiple + 1, 4096)
-                    size = 16 * (new_mtu // 16 - 1) - packet_struct.size - 1
-                    p = Packet(CONTROL_MTU, CycInt(new_mtu), 0, time(), b'#' * size)
-                    self.sendto(self._encrypt(packet2bin(p)), self.address)
-                except s.error:
-                    pass  # Message too long
-                last_mtu_fix_time = time()
 
             # received packet
             if r:
@@ -417,30 +402,6 @@ class SecureReliableSocket(socket):
                                 self.sendto(self._encrypt(packet2bin(re_packet)), self.address)
                                 retransmitted.append(packet.time)
                                 break
-                    # too big? fix MTU smaller
-                    if self.span < time() - last_mtu_fix_time:
-                        if 1 < len(retransmitted):
-                            ave = (time() - retransmitted[0]) / len(retransmitted)
-                            if 1 < self.mtu_multiple and ave < self.timeout:
-                                try:
-                                    new_mtu = self.mtu_size * max(self.mtu_multiple - 1, 1)
-                                    size = 16 * (new_mtu // 16 - 1) - packet_struct.size - 1
-                                    p = Packet(CONTROL_MTU, CycInt(new_mtu), 0, time(), b'#' * size)
-                                    self.sendto(self._encrypt(packet2bin(p)), self.address)
-                                except s.error:
-                                    pass  # Message too long
-                        last_mtu_fix_time = time()
-                    continue
-
-                # receive MTU fix packet
-                if packet.control & CONTROL_MTU:
-                    if len(packet.data) == 0:
-                        # receive response: update to new MTU
-                        self.mtu_multiple = int(packet.sequence) // self.mtu_size
-                    else:
-                        # send response: success new MTU
-                        p = Packet(CONTROL_MTU, packet.sequence, 0, time(), b'')
-                        self.sendto(self._encrypt(packet2bin(p)), self.address)
                     continue
 
                 # broadcast packet
@@ -549,7 +510,7 @@ class SecureReliableSocket(socket):
 
     def get_window_size(self) -> int:
         """maximum size of data you can send at once"""
-        return self.mtu_size * self.mtu_multiple - 32 - packet_struct.size
+        return self.mtu_size - 32 - packet_struct.size
 
     def send(self, data: bytes, flags: int = 0) -> int:
         """over write low-level method for compatibility"""
