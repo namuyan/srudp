@@ -185,7 +185,41 @@ class SecureReliableSocket(socket):
         self.established = False
 
     def connect(self, address: _WildAddress) -> None:
-        """UDP hole punching & get shared key"""
+        """
+        `connection()` establishment process
+        ====
+        ```uml
+                          ┌─┐                                            ┌─┐
+                          │A│                                            │B│
+                          └┬┘                                            └┬┘
+                           │              udp-hole-punching               │
+                           │────────────────────────────────────────────> │
+                           │                                              │
+                           │           udp-hole-punching (fail)           │
+                           │ X<───────────────────────────────────────────│
+                           │                                              │
+                           │               send B's publicKey             │
+                           │ <────────────────────────────────────────────│
+                           │                                              │
+                           │ send sharedKey (encrypted by sharedPoint)    │ ╔═══════════════╗
+                           │───────────────────────────────────────────────>║ B established ║
+                           │                                              │ ╚═══════════════╝
+        ╔════════════════╗ │ send establish flag (encrypted by sharedKey) │
+        ║ A established  ║<───────────────────────────────────────────────│
+        ╚════════════════╝ │                                              │
+                          ┌┴┐                                            ┌┴┐
+                          │A│                                            │B│
+                          └─┘                                            └─┘
+        ```
+
+        note
+        ----
+        * only one of two hole-punching is success in most case.
+        * when both hole-punching is success, use high priority side's sharedKey, but is rare case.
+        * when both hole-punching is fail, you can't use UDP-hole-punching method in your network.
+        * sharedPoint is calculated by multiply secretKey with publicKey.
+        * sharedKey is random 256bit bytes, don't use sharedPoint as sharedKey.
+        """
         assert not self.established, "already established"
         assert not self.is_closed, "already closed socket"
         assert not self.try_connect, "already try to connect"
