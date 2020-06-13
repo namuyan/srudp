@@ -117,14 +117,14 @@ generate random 16Mb binary and send.
 >>> sock.sendall(data)
 ```
 
-receive the data and check sha256. Be careful don't overflow buffer.
+receive the data and check sha256.
 ```shell script
 >>> from hashlib import sha256
 >>> sock.settimeout(30.0)
 >>> data = b''
 >>> while True:
         try:
-...         data += sock.recv(1024*1024*1024)
+...         data += sock.recv(8192)
 ...     except Exception as e:
 ...         print("timeout", e)
 ...         break
