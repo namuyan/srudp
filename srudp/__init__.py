@@ -152,7 +152,7 @@ class SecureReliableSocket(socket):
         "timeout", "span", "address", "shared_key", "mtu_size",
         "sender_seq", "sender_buffer", "sender_signal", "sender_buffer_lock",
         "receiver_seq", "receiver_buffer", "receiver_signal", "receiver_buffer_lock",
-        "broadcast_hook_fnc", "loss", "established"]
+        "broadcast_hook_fnc", "loss", "try_connect", "established"]
 
     def __init__(self, family: int = s.AF_INET, timeout: float = 21.0, span: float = 3.0) -> None:
         """
@@ -181,14 +181,22 @@ class SecureReliableSocket(socket):
         self.broadcast_hook_fnc: Optional[_BroadcastHook] = None
         # status
         self.loss = 0
+        self.try_connect = False
         self.established = False
 
     def connect(self, address: _WildAddress) -> None:
         """UDP hole punching & get shared key"""
         assert not self.established, "already established"
+        assert not self.is_closed, "already closed socket"
+        assert not self.try_connect, "already try to connect"
+
+        # start communication (only once you can try)
+        self.try_connect = True
+
+        # bind socket address
         self.address = address = get_formal_address_format(address, self.family)
         address_copy = list(address)
-        address_copy[0] = ""  # bind global address
+        address_copy[0] = ""  # the port is CLOSE_WAIT state if this raise OSError
         self.bind(tuple(address_copy))
         log.debug("try to communicate with {}".format(address))
 
@@ -200,8 +208,12 @@ class SecureReliableSocket(socket):
         punch_msg = b"udp hole punching"
         self.sendto(S_HOLE_PUNCHING + punch_msg + select_curve.name.encode(), address)
 
-        # my secret key
+        # my secret & public key
         my_sk: Optional[ecdsa.SigningKey] = None
+        my_pk: Optional[ecdsa.VerifyingKey] = None
+
+        # other's public key
+        other_pk: Optional[ecdsa.VerifyingKey] = None
 
         check_msg = b"success hand shake"
         for _ in range(int(self.timeout / self.span)):
@@ -237,7 +249,20 @@ class SecureReliableSocket(socket):
                 elif stage == S_SEND_SHARED_KEY:
                     # 4. decrypt shared key & send hello msg
                     encrypted_data = data.decode().split("+")
-                    other_pk = ecdsa.VerifyingKey.from_string(a2b_hex(encrypted_data[0]), select_curve)
+                    if other_pk is None:
+                        other_pk = ecdsa.VerifyingKey.from_string(a2b_hex(encrypted_data[0]), select_curve)
+                    else:
+                        log.debug("need to check priority because already get others's pk")
+                        my_pri = sha256(my_pk.to_string() + other_pk.to_string()).digest()
+                        other_pri = sha256(other_pk.to_string() + my_pk.to_string()).digest()
+                        # check 256bit int as big-endian
+                        if my_pri < other_pri:
+                            log.debug("my priority is LOW and over write my shared key by other's")
+                        elif other_pri < my_pri:
+                            log.debug("my priority is HIGH and ignore this command")
+                            continue
+                        else:
+                            raise ConnectionError("my and other's key is same, this means you connect to yourself")
                     if my_sk is None:
                         raise ConnectionError("not found my_sk")
                     shared_point = my_sk.privkey.secret_multiplier * other_pk.pubkey.point
@@ -628,11 +653,11 @@ class SecureReliableSocket(socket):
 
     def close(self) -> None:
         if self.established:
+            self.established = False
             p = Packet(CONTROL_FIN, CYC_INT0, 0, time(), b'closed')
             self.sendto(self._encrypt(packet2bin(p)), self.address)
             sleep(0.001)
             super().close()
-            self.established = False
             atexit.unregister(self.close)
             self.receiver_signal.set()
 
