@@ -35,6 +35,7 @@ setup(
     classifiers=[
         'Typing :: Typed',
         'Topic :: Internet',
+        'Framework :: AsyncIO',
         'Topic :: System :: Networking',
         'Development Status :: 3 - Alpha',
         'Programming Language :: Python :: 3',

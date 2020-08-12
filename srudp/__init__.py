@@ -147,12 +147,21 @@ def get_formal_address_format(address: _WildAddress, family: int = s.AF_INET) ->
         raise ConnectionError("not found correct ip format of {}".format(address))
 
 
+def get_self_bind_sock() -> socket:
+    """send to and recv from same socket"""
+    sock = socket(s.AF_INET, s.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    address = sock.getsockname()
+    sock.connect(address)
+    return sock
+
+
 class SecureReliableSocket(socket):
     __slots__ = [
         "timeout", "span", "address", "shared_key", "mtu_size",
         "sender_seq", "sender_buffer", "sender_signal", "sender_buffer_lock",
-        "receiver_seq", "receiver_buffer", "receiver_signal", "receiver_buffer_lock",
-        "backend_lock", "broadcast_hook_fnc", "loss", "try_connect", "established"]
+        "receiver_seq", "receiver_unread_size", "receiver_buffer",
+        "broadcast_hook_fnc", "loss", "try_connect", "established"]
 
     def __init__(self, family: int = s.AF_INET, timeout: float = 21.0, span: float = 3.0) -> None:
         """
@@ -174,10 +183,8 @@ class SecureReliableSocket(socket):
         self.sender_buffer_lock = threading.Lock()
         # receiver params
         self.receiver_seq = CycInt(1)  # next receive sequence
-        self.receiver_buffer = BytesIO()
-        self.receiver_signal = threading.Event()
-        self.receiver_buffer_lock = threading.Lock()
-        self.backend_lock = threading.Lock()  # to wait packet processing finish
+        self.receiver_unread_size = 0
+        self.receiver_buffer = get_self_bind_sock()
         # broadcast hook
         self.broadcast_hook_fnc: Optional[_BroadcastHook] = None
         # status
@@ -252,7 +259,7 @@ class SecureReliableSocket(socket):
 
         check_msg = b"success hand shake"
         for _ in range(int(self.timeout / self.span)):
-            r, _w, _x = select([self], [], [], self.span)
+            r, _w, _x = select([super().fileno()], [], [], self.span)
             if r:
                 data, _addr = self.recvfrom(1024)
                 stage, data = data[:1], data[1:]
@@ -346,7 +353,7 @@ class SecureReliableSocket(socket):
         my_mut_size = None
         finished_notify = False
         for _ in range(int(self.timeout/wait)):
-            r, _w, _x = select([self], [], [], wait)
+            r, _w, _x = select([super().fileno()], [], [], wait)
             if r:
                 data, _addr = self.recvfrom(1500)
                 if data.startswith(b'#####'):
@@ -384,190 +391,188 @@ class SecureReliableSocket(socket):
         last_ack_time = time()
 
         while not self.is_closed:
-            with self.backend_lock:
-                r, _w, _x = select([self], [], [], self.span)
+            r, _w, _x = select([super().fileno()], [], [], self.span)
 
-                # re-transmit
-                if 0 < len(self.sender_buffer):
-                    with self.sender_buffer_lock:
-                        now = time() - self.span * 2
-                        transmit_limit = MAX_RETRANSMIT_LIMIT  # max transmit at once
-                        for i, p in enumerate(self.sender_buffer):
-                            if transmit_limit == 0:
-                                break
-                            if p.time < now:
-                                self.loss += 1
-                                re_packet = Packet(p.control, p.sequence, p.retry+1, time(), p.data)
-                                self.sender_buffer[i] = re_packet
-                                self.sendto(self._encrypt(packet2bin(re_packet)), self.address)
-                                transmit_limit -= 1
-
-                # send ack as ping (stream may be free)
-                if self.span < time() - last_ack_time:
-                    p = Packet(CONTROL_ACK, self.receiver_seq - 1, 0, time(), b'as ping')
-                    self.sendto(self._encrypt(packet2bin(p)), self.address)
-                    last_ack_time = time()
-
-                # connection may be broken
-                if self.timeout < time() - last_receive_time:
-                    p = Packet(CONTROL_FIN, CYC_INT0, 0, time(), b'stream may be broken')
-                    self.sendto(self._encrypt(packet2bin(p)), self.address)
-                    break
-
-                # just socket select timeout (no data received yet)
-                if len(r) == 0:
-                    continue
-
-                # received a packet data
-                try:
-                    data, _addr = self.recvfrom(65536)
-                    packet = bin2packet(self._decrypt(data))
-
-                    # reject too early or late packet
-                    if 3600.0 < abs(time() - packet.time):
-                        continue
-
-                    last_receive_time = time()
-                    # log.debug("r<< %s", packet)
-                except ValueError:
-                    # log.debug("decrypt failed len=%s..".format(data[:10]))
-                    continue
-                except (ConnectionResetError, OSError):
-                    break
-                except Exception:
-                    log.error("UDP socket closed", exc_info=True)
-                    break
-
-                # receive ack
-                if packet.control & CONTROL_ACK:
-                    with self.sender_buffer_lock:
-                        if 0 < len(self.sender_buffer):
-                            for i in range(packet.sequence - self.sender_buffer[0].sequence + 1):
-                                self.sender_buffer.popleft()
-                                if len(self.sender_buffer) == 0:
-                                    break
-                            if not self._send_buffer_is_full():
-                                self.sender_signal.set()
-                    continue
-
-                # receive reset
-                if packet.control & CONTROL_FIN:
-                    p = Packet(CONTROL_FIN, CYC_INT0, 0, time(), b'be notified fin or reset')
-                    self.sendto(self._encrypt(packet2bin(p)), self.address)
-                    break
-
-                # asked re-transmission
-                if packet.control & CONTROL_RTM:
-                    with self.sender_buffer_lock:
-                        for i, p in enumerate(self.sender_buffer):
-                            if p.sequence == packet.sequence:
-                                re_packet = Packet(p.control, p.sequence, p.retry+1, time(), p.data)
-                                self.sender_buffer[i] = re_packet
-                                self.sendto(self._encrypt(packet2bin(re_packet)), self.address)
-                                retransmitted.append(packet.time)
-                                break
-                    continue
-
-                # broadcast packet
-                if packet.control & CONTROL_BCT:
-                    if self.broadcast_hook_fnc is not None:
-                        self.broadcast_hook_fnc(packet)
-                    elif last_packet is None or last_packet.control & CONTROL_EOF:
-                        self._push_receive_buffer(packet.data)
-                    else:
-                        broadcast_packets.append(packet)
-                    continue
-
-                """normal packet from here (except PSH, EOF)"""
-
-                # check the packet is retransmitted
-                if 0 < packet.retry and 0 < len(retransmit_packets):
-                    limit = time() - self.span
-                    for i, p in enumerate(retransmit_packets):
-                        if p.sequence == packet.sequence:
-                            del retransmit_packets[i]
-                            break  # success retransmitted
-                        if p.sequence < self.receiver_seq:
-                            del retransmit_packets[i]
-                            break  # already received
-                    for i, p in enumerate(retransmit_packets):
-                        # too old retransmission request
-                        if p.time < limit:
-                            re_packet = Packet(CONTROL_RTM, p.sequence, p.retry+1, time(), b'')
-                            retransmit_packets[i] = re_packet
-                            self.sendto(self._encrypt(packet2bin(re_packet)), self.address)
-                            self.loss += 1
+            # re-transmit
+            if 0 < len(self.sender_buffer):
+                with self.sender_buffer_lock:
+                    now = time() - self.span * 2
+                    transmit_limit = MAX_RETRANSMIT_LIMIT  # max transmit at once
+                    for i, p in enumerate(self.sender_buffer):
+                        if transmit_limit == 0:
                             break
+                        if p.time < now:
+                            self.loss += 1
+                            re_packet = Packet(p.control, p.sequence, p.retry+1, time(), p.data)
+                            self.sender_buffer[i] = re_packet
+                            self.sendto(self._encrypt(packet2bin(re_packet)), self.address)
+                            transmit_limit -= 1
 
-                # receive data
-                if packet.sequence == self.receiver_seq:
-                    self.receiver_seq += 1
+            # send ack as ping (stream may be free)
+            if self.span < time() - last_ack_time:
+                p = Packet(CONTROL_ACK, self.receiver_seq - 1, 0, time(), b'as ping')
+                self.sendto(self._encrypt(packet2bin(p)), self.address)
+                last_ack_time = time()
+
+            # connection may be broken
+            if self.timeout < time() - last_receive_time:
+                p = Packet(CONTROL_FIN, CYC_INT0, 0, time(), b'stream may be broken')
+                self.sendto(self._encrypt(packet2bin(p)), self.address)
+                break
+
+            # just socket select timeout (no data received yet)
+            if len(r) == 0:
+                continue
+
+            """received a packet data"""
+
+            try:
+                data, _addr = self.recvfrom(65536)
+                packet = bin2packet(self._decrypt(data))
+
+                # reject too early or late packet
+                if 3600.0 < abs(time() - packet.time):
+                    continue
+
+                last_receive_time = time()
+                # log.debug("r<< %s", packet)
+            except ValueError:
+                # log.debug("decrypt failed len=%s..".format(data[:10]))
+                continue
+            except (ConnectionResetError, OSError):
+                break
+            except Exception:
+                log.error("UDP socket closed", exc_info=True)
+                break
+
+            # receive ack
+            if packet.control & CONTROL_ACK:
+                with self.sender_buffer_lock:
+                    if 0 < len(self.sender_buffer):
+                        for i in range(packet.sequence - self.sender_buffer[0].sequence + 1):
+                            self.sender_buffer.popleft()
+                            if len(self.sender_buffer) == 0:
+                                break
+                        if not self._send_buffer_is_full():
+                            self.sender_signal.set()
+                continue
+
+            # receive reset
+            if packet.control & CONTROL_FIN:
+                p = Packet(CONTROL_FIN, CYC_INT0, 0, time(), b'be notified fin or reset')
+                self.sendto(self._encrypt(packet2bin(p)), self.address)
+                break
+
+            # asked re-transmission
+            if packet.control & CONTROL_RTM:
+                with self.sender_buffer_lock:
+                    for i, p in enumerate(self.sender_buffer):
+                        if p.sequence == packet.sequence:
+                            re_packet = Packet(p.control, p.sequence, p.retry+1, time(), p.data)
+                            self.sender_buffer[i] = re_packet
+                            self.sendto(self._encrypt(packet2bin(re_packet)), self.address)
+                            retransmitted.append(packet.time)
+                            break
+                continue
+
+            # broadcast packet
+            if packet.control & CONTROL_BCT:
+                if self.broadcast_hook_fnc is not None:
+                    self.broadcast_hook_fnc(packet)
+                elif last_packet is None or last_packet.control & CONTROL_EOF:
                     self._push_receive_buffer(packet.data)
-                elif packet.sequence > self.receiver_seq:
-                    temporary[packet.sequence] = packet
-                    # ask re-transmission if not found before packet
-                    lost_sequence = packet.sequence - 1
-                    if lost_sequence not in temporary:
-                        for p in retransmit_packets:
-                            if p.sequence == lost_sequence:
-                                break  # already pushed request
-                        else:
-                            re_packet = Packet(CONTROL_RTM, lost_sequence, 0, time(), b'')
-                            self.sendto(self._encrypt(packet2bin(re_packet)), self.address)
-                            self.loss += 1
-                            retransmit_packets.append(re_packet)
-                    else:
-                        pass  # do not do anything..
                 else:
-                    pass  # ignore old packet
+                    broadcast_packets.append(packet)
+                continue
 
-                # request all lost packets when PSH (end of chunk)
-                if (packet.control & CONTROL_PSH) and 0 < len(retransmit_packets):
-                    if 0 < len(retransmit_packets):
-                        for i, p in enumerate(retransmit_packets):
-                            if time() - p.time < self.span:
-                                continue  # too early to RTM
-                            re_packet = Packet(CONTROL_RTM, p.sequence, p.retry+1, time(), b'')
-                            retransmit_packets[i] = re_packet
-                            self.sendto(self._encrypt(packet2bin(re_packet)), self.address)
-                            self.loss += 1
+            """normal packet from here (except PSH, EOF)"""
 
-                # fix packet order & push buffer
-                if self.receiver_seq in temporary:
-                    for sequence in sorted(temporary):
-                        if sequence == self.receiver_seq:
-                            self.receiver_seq += 1
-                            packet = temporary.pop(sequence)  # warning: over write packet
-                            self._push_receive_buffer(packet.data)
+            # check the packet is retransmitted
+            if 0 < packet.retry and 0 < len(retransmit_packets):
+                limit = time() - self.span
+                for i, p in enumerate(retransmit_packets):
+                    if p.sequence == packet.sequence:
+                        del retransmit_packets[i]
+                        break  # success retransmitted
+                    if p.sequence < self.receiver_seq:
+                        del retransmit_packets[i]
+                        break  # already received
+                for i, p in enumerate(retransmit_packets):
+                    # too old retransmission request
+                    if p.time < limit:
+                        re_packet = Packet(CONTROL_RTM, p.sequence, p.retry+1, time(), b'')
+                        retransmit_packets[i] = re_packet
+                        self.sendto(self._encrypt(packet2bin(re_packet)), self.address)
+                        self.loss += 1
+                        break
 
-                # push buffer immediately
-                if packet.control & CONTROL_PSH:
-                    # send ack
-                    p = Packet(CONTROL_ACK, self.receiver_seq - 1, 0, time(), b'put buffer')
-                    self.sendto(self._encrypt(packet2bin(p)), self.address)
-                    last_ack_time = time()
-                    # log.debug("pushed! buffer %d %s", len(retransmit_packets), retransmit_packets)
+            # receive data
+            if packet.sequence == self.receiver_seq:
+                self.receiver_seq += 1
+                self._push_receive_buffer(packet.data)
+            elif packet.sequence > self.receiver_seq:
+                temporary[packet.sequence] = packet
+                # ask re-transmission if not found before packet
+                lost_sequence = packet.sequence - 1
+                if lost_sequence not in temporary:
+                    for p in retransmit_packets:
+                        if p.sequence == lost_sequence:
+                            break  # already pushed request
+                    else:
+                        re_packet = Packet(CONTROL_RTM, lost_sequence, 0, time(), b'')
+                        self.sendto(self._encrypt(packet2bin(re_packet)), self.address)
+                        self.loss += 1
+                        retransmit_packets.append(re_packet)
+                else:
+                    pass  # do not do anything..
+            else:
+                pass  # ignore old packet
 
-                # reached EOF & push broadcast packets
-                if packet.control & CONTROL_EOF:
-                    for p in broadcast_packets:
-                        self._push_receive_buffer(p.data)
-                    broadcast_packets.clear()
+            # request all lost packets when PSH (end of chunk)
+            if (packet.control & CONTROL_PSH) and 0 < len(retransmit_packets):
+                if 0 < len(retransmit_packets):
+                    for i, p in enumerate(retransmit_packets):
+                        if time() - p.time < self.span:
+                            continue  # too early to RTM
+                        re_packet = Packet(CONTROL_RTM, p.sequence, p.retry+1, time(), b'')
+                        retransmit_packets[i] = re_packet
+                        self.sendto(self._encrypt(packet2bin(re_packet)), self.address)
+                        self.loss += 1
 
-                # update last packet
-                last_packet = packet
+            # fix packet order & push buffer
+            if self.receiver_seq in temporary:
+                for sequence in sorted(temporary):
+                    if sequence == self.receiver_seq:
+                        self.receiver_seq += 1
+                        packet = temporary.pop(sequence)  # warning: over write packet
+                        self._push_receive_buffer(packet.data)
+
+            # push buffer immediately
+            if packet.control & CONTROL_PSH:
+                # send ack
+                p = Packet(CONTROL_ACK, self.receiver_seq - 1, 0, time(), b'put buffer')
+                self.sendto(self._encrypt(packet2bin(p)), self.address)
+                last_ack_time = time()
+                # log.debug("pushed! buffer %d %s", len(retransmit_packets), retransmit_packets)
+
+            # reached EOF & push broadcast packets
+            if packet.control & CONTROL_EOF:
+                for p in broadcast_packets:
+                    self._push_receive_buffer(p.data)
+                broadcast_packets.clear()
+
+            # update last packet
+            last_packet = packet
 
         # close
         self.close()
 
     def _push_receive_buffer(self, data: bytes) -> None:
         """just append new data to buffer"""
-        with self.receiver_buffer_lock:
-            pos = self.receiver_buffer.tell()
-            self.receiver_buffer.seek(0, SEEK_END)
-            self.receiver_buffer.write(data)
-            self.receiver_buffer.seek(pos)
-            self.receiver_signal.set()
+        if self.receiver_buffer.fileno() == -1:
+            return  # already closed
+        self.receiver_buffer.sendall(data)
+        self.receiver_unread_size += len(data)
 
     def _send_buffer_is_full(self) -> bool:
         return SEND_BUFFER_SIZE < sum(len(p.data) for p in self.sender_buffer)
@@ -638,38 +643,15 @@ class SecureReliableSocket(socket):
 
     def recv(self, buflen: int = 1024, flags: int = 0) -> bytes:
         assert flags == 0, "unrecognized flags"
-        timeout = self.gettimeout()
-        while not self.is_closed:
-            if not self.established:
-                return b''
-            # check data exist
-            if timeout is None:
-                # blocking forever
-                if not self.receiver_signal.wait(1.0):
-                    continue
-            elif timeout == 0.0:
-                # non-blocking
-                with self.backend_lock:
-                    # note: wait backend to avoid check signal before backend's process finish
-                    if not self.receiver_signal.is_set():
-                        raise BlockingIOError("you should ignore this error "
-                                              "because it caused by inner packet")
-            else:
-                # blocking for some Secs
-                if not self.receiver_signal.wait(timeout):
-                    raise s.timeout()
-            # receive now
-            with self.receiver_buffer_lock:
-                data = self.receiver_buffer.read(buflen)
-                if len(data) == 0:
-                    # delete old data
-                    self.receiver_buffer.seek(0)
-                    self.receiver_buffer.truncate(0)
-                    self.receiver_signal.clear()
-                    continue
-                else:
-                    return data
-        return b''
+
+        if self.is_closed:
+            return b""
+        elif not self.established:
+            return b""
+        else:
+            data = self.receiver_buffer.recv(buflen, flags)
+            self.receiver_unread_size -= len(data)
+            return data
 
     def _encrypt(self, data: bytes) -> bytes:
         """encrypt by AES-GCM (more secure than CBC mode)"""
@@ -685,6 +667,18 @@ class SecureReliableSocket(socket):
         # ValueError raised when verify failed
         return cipher.decrypt_and_verify(data[32:], data[16:32])
 
+    def fileno(self) -> int:
+        """this may used by non-blocking io"""
+        return self.receiver_buffer.fileno()
+
+    def gettimeout(self) -> Optional[float]:
+        """return inner receiver's instead"""
+        return self.receiver_buffer.gettimeout()
+
+    def settimeout(self, value: Optional[float]) -> None:
+        """change inner receiver's instead"""
+        self.receiver_buffer.settimeout(value)
+
     @property
     def is_closed(self) -> bool:
         if self.fileno() == -1:
@@ -693,6 +687,11 @@ class SecureReliableSocket(socket):
             return True
         return False
 
+    @property
+    def type(self) -> s.SocketKind:  # type: ignore
+        """display pseudo TCP (real type is UDP)"""
+        return s.SOCK_STREAM
+
     def close(self) -> None:
         if self.established:
             self.established = False
@@ -700,8 +699,8 @@ class SecureReliableSocket(socket):
             self.sendto(self._encrypt(packet2bin(p)), self.address)
             sleep(0.001)
             super().close()
+            self.receiver_buffer.close()
             atexit.unregister(self.close)
-            self.receiver_signal.set()
 
 
 def find_ecdhe_curve(curve_name: str) -> ecdsa.curves.Curve:

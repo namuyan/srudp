@@ -13,6 +13,7 @@ Features
 * UDP hole punching
 * high performance (4Mbps/s Up&Down when 10mb)
 * ipv4/ipv6
+* optional asyncio
 
 Requirement
 ----
@@ -58,6 +59,40 @@ while not sock.is_closed:
 print("closed", sock)
 ```
 Another side, receive the message and show immediately.
+
+asyncio usage
+----
+```python
+from srudp import SecureReliableSocket
+import asyncio
+
+# Get a reference to the current event loop
+loop = asyncio.get_event_loop()
+
+# create a socket
+sock = SecureReliableSocket()
+
+# connect() on another thread because block event loop
+address = ("example.com", 3000)
+await loop.run_in_executor(None, sock.connect, (address,))
+
+# Register the open socket to wait for data
+reader, writer = await asyncio.open_connection(sock=sock)
+
+# read
+data = await reader.read(1024)
+
+# write
+writer.write(b"hello")
+writer.write(b"world")
+await writer.drain()
+
+# close
+writer.close()
+```
+You can do just like a normal TCP socket.
+But if you don't intend, like HTTP protocol which requires a lot of connections,
+you don't have to use async method.
 
 to avoid troubles
 ----
