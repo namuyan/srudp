@@ -167,7 +167,7 @@ normal `sock.sendall` message go `sock.recv`, only broadcast message.
 You will have big latency when don't hook broadcast
 because normal data stream block broadcast to avoid confuse data.
 ```shell script
->>> sock.broadcast_hook_fnc = lambda p: print(p, ",", p.data)
+>>> sock.broadcast_hook_fnc = lambda (p, s): print(p, ",", p.data)
 Packet(BCT seq:0 retry:0 time:1591543763.87 data:4b) , b'why?'
 ```
 

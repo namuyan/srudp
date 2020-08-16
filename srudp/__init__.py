@@ -57,7 +57,7 @@ S_ESTABLISHED = b'\x03'
 # typing
 _Address = Tuple[Any, ...]
 _WildAddress = Union[_Address, str, bytes]
-_BroadcastHook = Callable[['Packet'], None]
+_BroadcastHook = Callable[['Packet', 'SecureReliableSocket'], None]
 
 
 class CycInt(int):
@@ -185,6 +185,7 @@ class SecureReliableSocket(socket):
         self.receiver_unread_size = 0
         self.receiver_buffer = get_self_bind_sock()
         # broadcast hook
+        # note: don't block this method or backend thread will be broken
         self.broadcast_hook_fnc: Optional[_BroadcastHook] = None
         # status
         self.loss = 0
@@ -384,7 +385,6 @@ class SecureReliableSocket(socket):
         temporary = dict()
         retransmit_packets: Deque[Packet] = deque()
         retransmitted: Deque[float] = deque(maxlen=16)
-        broadcast_packets: Deque[Packet] = deque(maxlen=16)
         last_packet: Optional[Packet] = None
         last_receive_time = time()
         last_ack_time = time()
@@ -477,11 +477,12 @@ class SecureReliableSocket(socket):
             # broadcast packet
             if packet.control & CONTROL_BCT:
                 if self.broadcast_hook_fnc is not None:
-                    self.broadcast_hook_fnc(packet)
+                    self.broadcast_hook_fnc(packet, self)
                 elif last_packet is None or last_packet.control & CONTROL_EOF:
                     self._push_receive_buffer(packet.data)
                 else:
-                    broadcast_packets.append(packet)
+                    # note: acquire realtime response
+                    log.debug("throw away %s", packet)
                 continue
 
             """normal packet from here (except PSH, EOF)"""
@@ -556,9 +557,8 @@ class SecureReliableSocket(socket):
 
             # reached EOF & push broadcast packets
             if packet.control & CONTROL_EOF:
-                for p in broadcast_packets:
-                    self._push_receive_buffer(p.data)
-                broadcast_packets.clear()
+                # note: stopped sending broadcast packet after main stream for realtime
+                log.debug("reached EOF of data")
 
             # update last packet
             last_packet = packet
@@ -772,7 +772,7 @@ def main() -> None:
                 log.debug("send broadcast!")
             sleep(20)
 
-    def broadcast_hook(packet: Packet) -> None:
+    def broadcast_hook(packet: Packet, _sock: SecureReliableSocket) -> None:
         log.debug("find you!!! (%s)", packet)
 
     sock.broadcast_hook_fnc = broadcast_hook
