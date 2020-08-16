@@ -7,7 +7,6 @@ from binascii import a2b_hex
 from Cryptodome.Cipher import AES
 from Cryptodome.Cipher._mode_gcm import GcmMode
 from struct import Struct
-from io import BytesIO, SEEK_END
 from socket import socket
 import socket as s
 import threading
@@ -678,6 +677,14 @@ class SecureReliableSocket(socket):
     def settimeout(self, value: Optional[float]) -> None:
         """change inner receiver's instead"""
         self.receiver_buffer.settimeout(value)
+
+    def getblocking(self) -> bool:
+        """return inner receiver's instead"""
+        return self.receiver_buffer.getblocking()
+
+    def setblocking(self, flag: bool) -> None:
+        """change inner receiver's instead"""
+        self.receiver_buffer.setblocking(flag)
 
     @property
     def is_closed(self) -> bool:
