@@ -339,7 +339,7 @@ class SecureReliableSocket(socket):
         log.debug("success get MUT size %db", self.mtu_size)
 
         # success establish connection
-        threading.Thread(target=self._backend, daemon=True).start()
+        threading.Thread(target=self._backend, name="SRUDP", daemon=True).start()
         self.established = True
 
         # auto exit when program closed
@@ -564,6 +564,7 @@ class SecureReliableSocket(socket):
             last_packet = packet
 
         # close
+        log.debug("srudp socket is closing now")
         self.close()
 
     def _push_receive_buffer(self, data: bytes) -> None:
@@ -648,9 +649,13 @@ class SecureReliableSocket(socket):
         elif not self.established:
             return b""
         else:
-            data = self.receiver_buffer.recv(buflen, flags)
-            self.receiver_unread_size -= len(data)
-            return data
+            try:
+                data = self.receiver_buffer.recv(buflen, flags)
+                self.receiver_unread_size -= len(data)
+                return data
+            except ConnectionError:
+                # self.close() called and buffer closed
+                return b""
 
     def _encrypt(self, data: bytes) -> bytes:
         """encrypt by AES-GCM (more secure than CBC mode)"""
