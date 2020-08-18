@@ -691,6 +691,15 @@ class SecureReliableSocket(socket):
         """change inner receiver's instead"""
         self.receiver_buffer.setblocking(flag)
 
+    def getpeername(self) -> _Address:
+        """connection info or raise OSError"""
+        if self.is_closed:
+            raise OSError("socket is closed")
+        elif self.address is None:
+            raise OSError("not found peer connection")
+        else:
+            return self.address
+
     @property
     def is_closed(self) -> bool:
         if self.fileno() == -1:
