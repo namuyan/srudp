@@ -27,6 +27,16 @@ Installation
 pip3 install --user srudp
 ```
 
+Tests
+----
+```commandline
+git clone https://github.com/namuyan/srudp
+cd srudp
+pip3 install --user -r requirements.txt
+python3 -m mypy --config-file=mypy.ini srudp
+python3 -m unittest discover
+```
+
 Demo
 ----
 Prepare two independent PCs.

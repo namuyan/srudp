@@ -75,7 +75,7 @@ class TestSocket(unittest.TestCase):
                     break
             except s.timeout:
                 break
-        assert received == data
+        assert received == data, (len(received), len(data))
 
         # close
         sock1.close()
@@ -92,16 +92,19 @@ class TestSocket(unittest.TestCase):
         sleep(1.0)
         fut2 = self.executor.submit(sock2.connect, ("::1", self.port2), self.port1)
 
-        fut1.result(10.0)
-        fut2.result(10.0)
+        try:
+            fut1.result(10.0)
+            fut2.result(10.0)
+        except s.gaierror as e:
+            sock1.close()
+            sock2.close()
+            return unittest.skip("ipv6 may be not supported: " + str(e))
 
         assert sock1.established and sock2.established, (sock1, sock2)
 
         # close
         sock1.close()
         sock2.close()
-
-        assert sock1.is_closed and sock2.is_closed, (sock1, sock2)
 
     def test_asyncio(self):
         loop = asyncio.get_event_loop()
