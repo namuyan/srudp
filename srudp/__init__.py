@@ -158,7 +158,7 @@ def get_self_bind_sock() -> socket:
 class SecureReliableSocket(socket):
     __slots__ = [
         "timeout", "span", "address", "shared_key", "mtu_size",
-        "sender_seq", "sender_buffer", "sender_signal", "sender_buffer_lock",
+        "sender_seq", "sender_buffer", "sender_signal", "sender_buffer_lock", "sender_socket",
         "receiver_seq", "receiver_unread_size", "receiver_buffer",
         "broadcast_hook_fnc", "loss", "try_connect", "established"]
 
@@ -180,6 +180,7 @@ class SecureReliableSocket(socket):
         self.sender_buffer: Deque[Packet] = deque()
         self.sender_signal = threading.Event()  # clear when buffer is empty
         self.sender_buffer_lock = threading.Lock()
+        self.sender_socket: Optional[socket] = None
         # receiver params
         self.receiver_seq = CycInt(1)  # next receive sequence
         self.receiver_unread_size = 0
@@ -192,7 +193,7 @@ class SecureReliableSocket(socket):
         self.try_connect = False
         self.established = False
 
-    def connect(self, address: _WildAddress) -> None:
+    def connect(self, address: _WildAddress, listen_port: int = None) -> None:
         """
         `connection()` establishment process
         ====
@@ -237,9 +238,19 @@ class SecureReliableSocket(socket):
 
         # bind socket address
         self.address = address = get_formal_address_format(address, self.family)
-        address_copy = list(address)
-        address_copy[0] = ""  # the port is CLOSE_WAIT state if this raise OSError
-        self.bind(tuple(address_copy))
+        bind_addr = list(address)
+
+        if listen_port is None:
+            # global
+            bind_addr[0] = ""
+        else:
+            # local (for debug)
+            bind_addr[0] = "localhost"
+            bind_addr[1] = listen_port
+            self.sender_socket = socket(self.family, s.SOCK_DGRAM)
+
+        # the port is CLOSE_WAIT state if this raise OSError
+        self.bind(tuple(bind_addr))
         log.debug("try to communicate with {}".format(address))
 
         # warning: allow only 256bit curve
@@ -618,6 +629,13 @@ class SecureReliableSocket(socket):
                 break
         return send_size
 
+    def sendto(self, data: bytes, address: _Address) -> int:  # type: ignore
+        """note: sendto() after bind() with different port cause OSError on recvfrom()"""
+        if self.sender_socket is None:
+            return super().sendto(data, address)
+        else:
+            return self.sender_socket.sendto(data, address)
+
     def sendall(self, data: bytes, flags: int = 0) -> None:
         """high-level method, use this instead of send()"""
         assert flags == 0, "unrecognized flags"
@@ -721,6 +739,8 @@ class SecureReliableSocket(socket):
             sleep(0.001)
             super().close()
             self.receiver_buffer.close()
+            if self.sender_socket is not None:
+                self.sender_socket.close()
             atexit.unregister(self.close)
 
 
