@@ -5,17 +5,28 @@ import socket as s
 import random
 import unittest
 import asyncio
+import logging
 import os
+
+
+logger = logging.getLogger("srudp")
+logger.setLevel(logging.DEBUG)
+formatter = logging.Formatter(
+    '[%(levelname)-6s] [%(threadName)-10s] [%(asctime)-24s] %(message)s')
+sh = logging.StreamHandler()
+sh.setLevel(logging.DEBUG)
+sh.setFormatter(formatter)
+logger.addHandler(sh)
 
 
 class TestSocket(unittest.TestCase):
     def setUp(self) -> None:
         self.port1 = random.randint(10000, 30000)
         self.port2 = random.randint(10000, 30000)
-        self.executor = ThreadPoolExecutor(4)
+        self.executor = ThreadPoolExecutor(4, thread_name_prefix="Thread")
 
     def tearDown(self) -> None:
-        self.executor.submit(True)
+        self.executor.shutdown(True)
 
     def test_basic(self):
         sock1 = SecureReliableSocket()
@@ -66,7 +77,8 @@ class TestSocket(unittest.TestCase):
 
         # 1M bits data
         data = os.urandom(1000000)
-        self.executor.submit(sock2.sendall, data)
+        self.executor.submit(sock2.sendall, data)\
+            .add_done_callback(lambda fut: fut.result())
         received = b""
         while True:
             try:
@@ -131,6 +143,7 @@ class TestSocket(unittest.TestCase):
             writer2.close()
 
         loop.run_until_complete(coro())
+        sleep(1.0)
         assert sock1.is_closed and sock2.is_closed, (sock1, sock2)
 
 
