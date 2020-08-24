@@ -262,8 +262,8 @@ class SecureReliableSocket(socket):
         self.sendto(S_HOLE_PUNCHING + punch_msg + select_curve.name.encode(), address)
 
         # my secret & public key
-        my_sk: Optional[ecdsa.SigningKey] = None
-        my_pk: Optional[ecdsa.VerifyingKey] = None
+        my_sk = ecdsa.SigningKey.generate(select_curve)
+        my_pk = my_sk.get_verifying_key()
 
         # other's public key
         other_pk: Optional[ecdsa.VerifyingKey] = None
@@ -278,19 +278,15 @@ class SecureReliableSocket(socket):
                 if stage == S_HOLE_PUNCHING:
                     # 2. send my public key
                     curve_name = data.replace(punch_msg, b'').decode()
+                    other_curve = find_ecdhe_curve(curve_name)
+                    assert select_curve == other_curve, ("different curve", select_curve, other_curve)
                     select_curve = find_ecdhe_curve(curve_name)
-                    # update curve
-                    my_sk = ecdsa.SigningKey.generate(select_curve)
-                    my_pk = my_sk.get_verifying_key()
                     self.sendto(S_SEND_PUBLIC_KEY + my_pk.to_string(), address)
                     log.debug("success UDP hole punching")
 
                 elif stage == S_SEND_PUBLIC_KEY:
                     # 3. get public key & send shared key
                     other_pk = ecdsa.VerifyingKey.from_string(data, select_curve)
-                    # using my select curve
-                    my_sk = ecdsa.SigningKey.generate(select_curve)
-                    my_pk = my_sk.get_verifying_key()
                     shared_point = my_sk.privkey.secret_multiplier * other_pk.pubkey.point
                     self.shared_key = sha256(shared_point.x().to_bytes(32, 'big')).digest()
                     shared_key = os.urandom(32)
