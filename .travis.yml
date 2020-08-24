@@ -31,3 +31,4 @@ install:
 # 'python3' is a 'command not found' error on Windows but 'py' works on Windows only
 script:
   - python3 -m mypy --config-file=mypy.ini srudp || python -m mypy --config-file=mypy.ini srudp
+  - python3 -m unittest discover || python -m unittest discover

@@ -1,8 +1,1 @@
-mypy^
-    --allow-redefinition^
-    --ignore-missing-imports^
-    --disallow-untyped-defs^
-    --warn-redundant-casts^
-    --no-implicit-optional^
-    --no-strict-optional^
-    srudp
+python -m mypy --config-file=mypy.ini srudp
