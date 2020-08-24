@@ -456,11 +456,13 @@ class SecureReliableSocket(socket):
                 with self.sender_buffer_lock:
                     if 0 < len(self.sender_buffer):
                         for i in range(packet.sequence - self.sender_buffer[0].sequence + 1):
+                            # remove packet that sent and confirmed by ACK
                             self.sender_buffer.popleft()
                             if len(self.sender_buffer) == 0:
                                 break
                         if not self._send_buffer_is_full():
                             self.sender_signal.set()
+                            log.debug("allow sending operation again seq={}".format(packet.sequence))
                 continue
 
             # receive reset
@@ -622,12 +624,15 @@ class SecureReliableSocket(socket):
             # block sendall() when buffer is full
             if buffer_is_full:
                 self.sender_signal.clear()
+                log.debug("buffer is full and wait for signaled")
                 break
         return send_size
 
     def sendto(self, data: bytes, address: _Address) -> int:  # type: ignore
         """note: sendto() after bind() with different port cause OSError on recvfrom()"""
-        if self.sender_socket is None:
+        if self.is_closed:
+            return 0
+        elif self.sender_socket is None:
             return super().sendto(data, address)
         else:
             return self.sender_socket.sendto(data, address)
@@ -635,13 +640,16 @@ class SecureReliableSocket(socket):
     def sendall(self, data: bytes, flags: int = 0) -> None:
         """high-level method, use this instead of send()"""
         assert flags == 0, "unrecognized flags"
-        if not self._send_buffer_is_full():
-            self.sender_signal.set()
         send_size = 0
         data = memoryview(data)
         while send_size < len(data):
+            if not self._send_buffer_is_full():
+                self.sender_signal.set()
             if self.sender_signal.wait(self.timeout):
                 send_size += self._send(data[send_size:])
+            else:
+                log.debug("waiting for sending buffer have space..")
+        log.debug("send operation success %sb", send_size)
 
     def broadcast(self, data: bytes) -> None:
         """broadcast data (do not check reach)"""
