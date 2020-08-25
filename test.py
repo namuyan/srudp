@@ -21,12 +21,14 @@ logger.addHandler(sh)
 
 class TestSocket(unittest.TestCase):
     def setUp(self) -> None:
+        logger.info("start")
         self.port1 = random.randint(10000, 30000)
         self.port2 = random.randint(10000, 30000)
         self.executor = ThreadPoolExecutor(4, thread_name_prefix="Thread")
 
     def tearDown(self) -> None:
         self.executor.shutdown(True)
+        logger.info("end")
 
     def test_basic(self):
         sock1 = SecureReliableSocket()
@@ -75,7 +77,7 @@ class TestSocket(unittest.TestCase):
         fut1.result(10.0)
         fut2.result(10.0)
 
-        # 1M bits data
+        # 1M bytes data
         data = os.urandom(1000000)
         self.executor.submit(sock2.sendall, data)\
             .add_done_callback(lambda fut: fut.result())
@@ -94,6 +96,9 @@ class TestSocket(unittest.TestCase):
         sock2.close()
 
     def test_ipv6(self):
+        if not s.has_ipv6:
+            return unittest.skip("ipv6 isn't supported")
+
         sock1 = SecureReliableSocket(s.AF_INET6)
         sock2 = SecureReliableSocket(s.AF_INET6)
         sock1.settimeout(5.0)
@@ -104,13 +109,8 @@ class TestSocket(unittest.TestCase):
         sleep(1.0)
         fut2 = self.executor.submit(sock2.connect, ("::1", self.port2), self.port1)
 
-        try:
-            fut1.result(10.0)
-            fut2.result(10.0)
-        except s.gaierror as e:
-            sock1.close()
-            sock2.close()
-            return unittest.skip("ipv6 may be not supported: " + str(e))
+        fut1.result(10.0)
+        fut2.result(10.0)
 
         assert sock1.established and sock2.established, (sock1, sock2)
 
@@ -137,7 +137,8 @@ class TestSocket(unittest.TestCase):
 
             writer1.write(b"nice world")
             await writer1.drain()
-            assert await reader2.read(1024) == b"nice world"
+            received = await reader2.read(1024)
+            assert received == b"nice world"
 
             writer1.close()
             writer2.close()

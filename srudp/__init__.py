@@ -256,6 +256,7 @@ class SecureReliableSocket(socket):
         # warning: allow only 256bit curve
         select_curve = ecdsa.curves.NIST256p
         log.debug("select curve {} (static)".format(select_curve))
+        assert select_curve.baselen == 32, ("curve is 256bits size only", select_curve)
 
         # 1. UDP hole punching
         punch_msg = b"udp hole punching"
@@ -340,7 +341,7 @@ class SecureReliableSocket(socket):
         # avoid Path MTU Discovery Blackhole
         if self.family == s.AF_INET:
             self.setsockopt(s.IPPROTO_IP, IP_MTU_DISCOVER, IP_PMTUDISC_DO)
-        self.mtu_size = self._find_mut_size()
+        self.mtu_size = self._find_mtu_size()
         if self.family == s.AF_INET:
             self.setsockopt(s.IPPROTO_IP, IP_MTU_DISCOVER, IP_PMTUDISC_DONT)
         log.debug("success get MUT size %db", self.mtu_size)
@@ -352,7 +353,7 @@ class SecureReliableSocket(socket):
         # auto exit when program closed
         atexit.register(self.close)
 
-    def _find_mut_size(self) -> int:
+    def _find_mtu_size(self) -> int:
         """confirm by submit real packet"""
         wait = 0.05
         mut = 1472  # max ipv4:1472b, ipv6:1452b
@@ -435,10 +436,6 @@ class SecureReliableSocket(socket):
             try:
                 data, _addr = self.recvfrom(65536)
                 packet = bin2packet(self._decrypt(data))
-
-                # reject too early or late packet
-                if 3600.0 < abs(time() - packet.time):
-                    continue
 
                 last_receive_time = time()
                 # log.debug("r<< %s", packet)
@@ -567,7 +564,7 @@ class SecureReliableSocket(socket):
             # reached EOF & push broadcast packets
             if packet.control & CONTROL_EOF:
                 # note: stopped sending broadcast packet after main stream for realtime
-                log.debug("reached EOF of data")
+                log.debug("reached end of chunk seq={}".format(packet.sequence))
 
             # update last packet
             last_packet = packet
@@ -588,6 +585,7 @@ class SecureReliableSocket(socket):
 
     def get_window_size(self) -> int:
         """maximum size of data you can send at once"""
+        # Packet = [nonce 16b][tag 16b][static 14b][data xb]
         return self.mtu_size - 32 - packet_struct.size
 
     def send(self, data: bytes, flags: int = 0) -> int:
@@ -600,17 +598,20 @@ class SecureReliableSocket(socket):
         """warning: row-level method"""
         if not self.established:
             raise ConnectionAbortedError('disconnected')
-        # decrease 1byte for padding of AES when packet is full size
+
         window_size = self.get_window_size()
         length = len(data) // window_size
         send_size = 0
         for i in range(length + 1):
-            control = 0
+            # control flag
+            control = 0b00000000
             buffer_is_full = self._send_buffer_is_full()
             if i == length or buffer_is_full:
                 control |= CONTROL_PSH
             if i == length:
                 control |= CONTROL_EOF
+
+            # send one packet
             throw = data[window_size * i:window_size * (i + 1)]
             with self.sender_buffer_lock:
                 packet = Packet(control, self.sender_seq, 0, time(), throw.tobytes())
@@ -618,9 +619,11 @@ class SecureReliableSocket(socket):
                 self.sendto(self._encrypt(packet2bin(packet)), self.address)
                 self.sender_seq += 1
             send_size += len(throw)
+
+            # note: sleep a mSec to avoid packet loss
             if window_size == len(throw):
-                # warning: need wait when send full size chunk
                 sleep(FULL_SIZE_PACKET_WAIT)
+
             # block sendall() when buffer is full
             if buffer_is_full:
                 self.sender_signal.clear()
