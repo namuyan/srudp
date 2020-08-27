@@ -18,6 +18,9 @@ sh.setLevel(logging.DEBUG)
 sh.setFormatter(formatter)
 logger.addHandler(sh)
 
+IS_TRAVIS = os.getenv('TRAVIS') == 'true'
+IS_WINDOWS = os.name == 'nt'
+
 
 class TestSocket(unittest.TestCase):
     def setUp(self) -> None:
@@ -31,6 +34,7 @@ class TestSocket(unittest.TestCase):
         logger.info("end")
 
     def test_basic(self):
+        logger.info("start test_basic()")
         sock1 = SecureReliableSocket()
         sock2 = SecureReliableSocket()
         sock1.settimeout(5.0)
@@ -65,6 +69,7 @@ class TestSocket(unittest.TestCase):
         sock2.close()
 
     def test_big_size(self):
+        logger.info("start test_big_size()")
         sock1 = SecureReliableSocket()
         sock2 = SecureReliableSocket()
         sock1.settimeout(5.0)
@@ -96,7 +101,9 @@ class TestSocket(unittest.TestCase):
         sock2.close()
 
     def test_ipv6(self):
-        if not s.has_ipv6:
+        logger.info("start test_ipv6()")
+        # https://docs.travis-ci.com/user/reference/overview/#virtualisation-environment-vs-operating-system
+        if IS_TRAVIS:
             return unittest.skip("ipv6 isn't supported")
 
         sock1 = SecureReliableSocket(s.AF_INET6)
@@ -119,12 +126,16 @@ class TestSocket(unittest.TestCase):
         sock2.close()
 
     def test_asyncio(self):
+        logger.info("start test_asyncio()")
+        if IS_TRAVIS and IS_WINDOWS:
+            return unittest.skip("travis's windows fail stream drain()")
+
         loop = asyncio.get_event_loop()
 
         sock1 = SecureReliableSocket()
         sock2 = SecureReliableSocket()
-        sock1.settimeout(None)
-        sock2.settimeout(None)
+        sock1.setblocking(False)
+        sock2.setblocking(False)
 
         async def coro():
             fut1 = loop.run_in_executor(self.executor, sock1.connect, ("127.0.0.1", self.port1), self.port2)
