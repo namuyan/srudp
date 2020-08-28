@@ -146,20 +146,11 @@ def get_formal_address_format(address: _WildAddress, family: int = s.AF_INET) ->
         raise ConnectionError("not found correct ip format of {}".format(address))
 
 
-def get_self_bind_sock() -> socket:
-    """send to and recv from same socket"""
-    sock = socket(s.AF_INET, s.SOCK_STREAM)
-    sock.bind(("127.0.0.1", 0))
-    address = sock.getsockname()
-    sock.connect(address)
-    return sock
-
-
 class SecureReliableSocket(socket):
     __slots__ = [
         "timeout", "span", "address", "shared_key", "mtu_size",
-        "sender_seq", "sender_buffer", "sender_signal", "sender_buffer_lock", "sender_socket",
-        "receiver_seq", "receiver_unread_size", "receiver_buffer",
+        "sender_seq", "sender_buffer", "sender_signal", "sender_buffer_lock", "sender_socket_optional",
+        "receiver_seq", "receiver_unread_size", "receiver_socket",
         "broadcast_hook_fnc", "loss", "try_connect", "established"]
 
     def __init__(self, family: int = s.AF_INET, timeout: float = 21.0, span: float = 3.0) -> None:
@@ -168,30 +159,54 @@ class SecureReliableSocket(socket):
         :param timeout: auto socket close by the time passed (sec)
         :param span: check socket status by the span (sec)
         """
-        super().__init__(family, s.SOCK_DGRAM)
+        # self bind buffer
+        super().__init__(family, s.SOCK_STREAM)
+        super().bind(("127.0.0.1" if family == s.AF_INET else "::1", 0))
+        self_address = super().getsockname()
+        super().connect(self_address)
+
         # inner params
         self.timeout = timeout
         self.span = span
         self.address: _Address = None
         self.shared_key: bytes = None
         self.mtu_size = 0  # 1472b
+
         # sender params
         self.sender_seq = CycInt(1)  # next send sequence
         self.sender_buffer: Deque[Packet] = deque()
         self.sender_signal = threading.Event()  # clear when buffer is empty
         self.sender_buffer_lock = threading.Lock()
-        self.sender_socket: Optional[socket] = None
+        self.sender_socket_optional: Optional[socket] = None
+
         # receiver params
         self.receiver_seq = CycInt(1)  # next receive sequence
         self.receiver_unread_size = 0
-        self.receiver_buffer = get_self_bind_sock()
+        self.receiver_socket = socket(family, s.SOCK_DGRAM)
+
         # broadcast hook
         # note: don't block this method or backend thread will be broken
         self.broadcast_hook_fnc: Optional[_BroadcastHook] = None
+
         # status
         self.loss = 0
         self.try_connect = False
         self.established = False
+
+    def __repr__(self) -> str:
+        if self.is_closed:
+            status = "CLOSED"
+        elif self.established:
+            status = "ESTABLISHED"
+        elif self.try_connect:
+            status = "FAILED"
+        else:
+            status = "UNKNOWN"
+        return "<SecureReliableSocket %s %s send=%s recv=%s loss=%s>"\
+               % (status, self.address, self.sender_seq, self.receiver_seq, self.loss)
+
+    def bind(self, _address: _WildAddress) -> None:
+        raise NotImplementedError("don't use bind() method")
 
     def connect(self, address: _WildAddress, listen_port: int = None) -> None:
         """
@@ -247,10 +262,10 @@ class SecureReliableSocket(socket):
             # local (for debug)
             bind_addr[0] = "localhost"
             bind_addr[1] = listen_port
-            self.sender_socket = socket(self.family, s.SOCK_DGRAM)
+            self.sender_socket_optional = socket(self.family, s.SOCK_DGRAM)
 
         # the port is CLOSE_WAIT state if this raise OSError
-        self.bind(tuple(bind_addr))
+        self.receiver_socket.bind(tuple(bind_addr))
         log.debug("try to communicate with {}".format(address))
 
         # warning: allow only 256bit curve
@@ -271,9 +286,9 @@ class SecureReliableSocket(socket):
 
         check_msg = b"success hand shake"
         for _ in range(int(self.timeout / self.span)):
-            r, _w, _x = select([super().fileno()], [], [], self.span)
+            r, _w, _x = select([self.receiver_socket.fileno()], [], [], self.span)
             if r:
-                data, _addr = self.recvfrom(1024)
+                data, _addr = self.receiver_socket.recvfrom(1024)
                 stage, data = data[:1], data[1:]
 
                 if stage == S_HOLE_PUNCHING:
@@ -340,10 +355,10 @@ class SecureReliableSocket(socket):
         # set don't-fragment flag & reset after
         # avoid Path MTU Discovery Blackhole
         if self.family == s.AF_INET:
-            self.setsockopt(s.IPPROTO_IP, IP_MTU_DISCOVER, IP_PMTUDISC_DO)
+            self.receiver_socket.setsockopt(s.IPPROTO_IP, IP_MTU_DISCOVER, IP_PMTUDISC_DO)
         self.mtu_size = self._find_mtu_size()
         if self.family == s.AF_INET:
-            self.setsockopt(s.IPPROTO_IP, IP_MTU_DISCOVER, IP_PMTUDISC_DONT)
+            self.receiver_socket.setsockopt(s.IPPROTO_IP, IP_MTU_DISCOVER, IP_PMTUDISC_DONT)
         log.debug("success get MUT size %db", self.mtu_size)
 
         # success establish connection
@@ -361,9 +376,9 @@ class SecureReliableSocket(socket):
         my_mut_size = None
         finished_notify = False
         for _ in range(int(self.timeout/wait)):
-            r, _w, _x = select([super().fileno()], [], [], wait)
+            r, _w, _x = select([self.receiver_socket.fileno()], [], [], wait)
             if r:
-                data, _addr = self.recvfrom(1500)
+                data, _addr = self.receiver_socket.recvfrom(1500)
                 if data.startswith(b'#####'):
                     if len(data) < receive_size:
                         self.sendto(receive_size.to_bytes(4, 'little'), self.address)
@@ -398,7 +413,7 @@ class SecureReliableSocket(socket):
         last_ack_time = time()
 
         while not self.is_closed:
-            r, _w, _x = select([super().fileno()], [], [], self.span)
+            r, _w, _x = select([self.receiver_socket.fileno()], [], [], self.span)
 
             # re-transmit
             if 0 < len(self.sender_buffer):
@@ -434,7 +449,7 @@ class SecureReliableSocket(socket):
             """received a packet data"""
 
             try:
-                data, _addr = self.recvfrom(65536)
+                data, _addr = self.receiver_socket.recvfrom(65536)
                 packet = bin2packet(self._decrypt(data))
 
                 last_receive_time = time()
@@ -575,9 +590,9 @@ class SecureReliableSocket(socket):
 
     def _push_receive_buffer(self, data: bytes) -> None:
         """just append new data to buffer"""
-        if self.receiver_buffer.fileno() == -1:
+        if self.fileno() == -1:
             return  # already closed
-        self.receiver_buffer.sendall(data)
+        super().sendall(data)
         self.receiver_unread_size += len(data)
 
     def _send_buffer_is_full(self) -> bool:
@@ -635,10 +650,10 @@ class SecureReliableSocket(socket):
         """note: sendto() after bind() with different port cause OSError on recvfrom()"""
         if self.is_closed:
             return 0
-        elif self.sender_socket is None:
-            return super().sendto(data, address)
+        elif self.sender_socket_optional is None:
+            return self.receiver_socket.sendto(data, address)
         else:
-            return self.sender_socket.sendto(data, address)
+            return self.sender_socket_optional.sendto(data, address)
 
     def sendall(self, data: bytes, flags: int = 0) -> None:
         """high-level method, use this instead of send()"""
@@ -675,7 +690,7 @@ class SecureReliableSocket(socket):
             return b""
         else:
             try:
-                data = self.receiver_buffer.recv(buflen, flags)
+                data = super().recv(buflen, flags)
                 self.receiver_unread_size -= len(data)
                 return data
             except ConnectionError:
@@ -696,25 +711,12 @@ class SecureReliableSocket(socket):
         # ValueError raised when verify failed
         return cipher.decrypt_and_verify(data[32:], data[16:32])
 
-    def fileno(self) -> int:
-        """this may used by non-blocking io"""
-        return self.receiver_buffer.fileno()
-
-    def gettimeout(self) -> Optional[float]:
-        """return inner receiver's instead"""
-        return self.receiver_buffer.gettimeout()
-
-    def settimeout(self, value: Optional[float]) -> None:
-        """change inner receiver's instead"""
-        self.receiver_buffer.settimeout(value)
-
-    def getblocking(self) -> bool:
-        """return inner receiver's instead"""
-        return self.receiver_buffer.getblocking()
-
-    def setblocking(self, flag: bool) -> None:
-        """change inner receiver's instead"""
-        self.receiver_buffer.setblocking(flag)
+    def getsockname(self) -> _Address:
+        """self bind info or raise OSError"""
+        if self.is_closed:
+            raise OSError("socket is closed")
+        else:
+            return self.receiver_socket.getsockname()  # type: ignore
 
     def getpeername(self) -> _Address:
         """connection info or raise OSError"""
@@ -733,21 +735,16 @@ class SecureReliableSocket(socket):
             return True
         return False
 
-    @property
-    def type(self) -> s.SocketKind:  # type: ignore
-        """display pseudo TCP (real type is UDP)"""
-        return s.SOCK_STREAM
-
     def close(self) -> None:
         if self.established:
             self.established = False
             p = Packet(CONTROL_FIN, CYC_INT0, 0, time(), b'closed')
             self.sendto(self._encrypt(packet2bin(p)), self.address)
             sleep(0.001)
+            self.receiver_socket.close()
             super().close()
-            self.receiver_buffer.close()
-            if self.sender_socket is not None:
-                self.sender_socket.close()
+            if self.sender_socket_optional is not None:
+                self.sender_socket_optional.close()
             atexit.unregister(self.close)
 
 
@@ -771,7 +768,9 @@ def get_mtu_linux(family: int, host: str) -> int:
 
 def main() -> None:
     """for test"""
-    import sys, random
+    import sys
+    import random
+
     remote_host = sys.argv[1]
     port = int(sys.argv[2])
     msglen = int(sys.argv[3])
