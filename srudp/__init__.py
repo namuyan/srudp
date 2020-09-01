@@ -304,7 +304,7 @@ class SecureReliableSocket(socket):
                     # 3. get public key & send shared key
                     other_pk = ecdsa.VerifyingKey.from_string(data, select_curve)
                     shared_point = my_sk.privkey.secret_multiplier * other_pk.pubkey.point
-                    self.shared_key = sha256(shared_point.x().to_bytes(32, 'big')).digest()
+                    self.shared_key = sha256(int(shared_point.x()).to_bytes(32, 'big')).digest()
                     shared_key = os.urandom(32)
                     encrypted_data = my_pk.to_string().hex() + "+" + self._encrypt(shared_key).hex()
                     self.shared_key = shared_key
@@ -331,7 +331,7 @@ class SecureReliableSocket(socket):
                     if my_sk is None:
                         raise ConnectionError("not found my_sk")
                     shared_point = my_sk.privkey.secret_multiplier * other_pk.pubkey.point
-                    self.shared_key = sha256(shared_point.x().to_bytes(32, 'big')).digest()
+                    self.shared_key = sha256(int(shared_point.x()).to_bytes(32, 'big')).digest()
                     self.shared_key = self._decrypt(a2b_hex(encrypted_data[1]))
                     self.sendto(S_ESTABLISHED + self._encrypt(check_msg), address)
                     log.debug("success decrypt shared key")
