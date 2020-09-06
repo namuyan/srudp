@@ -25,8 +25,7 @@ IS_WINDOWS = os.name == 'nt'
 class TestSocket(unittest.TestCase):
     def setUp(self) -> None:
         logger.info("start")
-        self.port1 = random.randint(10000, 30000)
-        self.port2 = random.randint(10000, 30000)
+        self.port = random.randint(10000, 30000)
         self.executor = ThreadPoolExecutor(4, thread_name_prefix="Thread")
 
     def tearDown(self) -> None:
@@ -41,8 +40,8 @@ class TestSocket(unittest.TestCase):
         sock2.settimeout(5.0)
 
         # connect
-        fut1 = self.executor.submit(sock1.connect, ("127.0.0.1", self.port1), self.port2)
-        fut2 = self.executor.submit(sock2.connect, ("127.0.0.1", self.port2), self.port1)
+        fut1 = self.executor.submit(sock1.connect, ("127.0.0.1", self.port))
+        fut2 = self.executor.submit(sock2.connect, ("127.0.0.1", self.port))
 
         fut1.result(10.0)
         fut2.result(10.0)
@@ -76,8 +75,8 @@ class TestSocket(unittest.TestCase):
         sock2.settimeout(5.0)
 
         # connect
-        fut1 = self.executor.submit(sock1.connect, ("127.0.0.1", self.port1), self.port2)
-        fut2 = self.executor.submit(sock2.connect, ("127.0.0.1", self.port2), self.port1)
+        fut1 = self.executor.submit(sock1.connect, ("127.0.0.1", self.port))
+        fut2 = self.executor.submit(sock2.connect, ("127.0.0.1", self.port))
 
         fut1.result(10.0)
         fut2.result(10.0)
@@ -112,9 +111,9 @@ class TestSocket(unittest.TestCase):
         sock2.settimeout(5.0)
 
         # connect
-        fut1 = self.executor.submit(sock1.connect, ("::1", self.port1), self.port2)
+        fut1 = self.executor.submit(sock1.connect, ("::1", self.port))
         sleep(1.0)
-        fut2 = self.executor.submit(sock2.connect, ("::1", self.port2), self.port1)
+        fut2 = self.executor.submit(sock2.connect, ("::1", self.port))
 
         fut1.result(10.0)
         fut2.result(10.0)
@@ -138,8 +137,8 @@ class TestSocket(unittest.TestCase):
         sock2.setblocking(False)
 
         async def coro():
-            fut1 = loop.run_in_executor(self.executor, sock1.connect, ("127.0.0.1", self.port1), self.port2)
-            fut2 = loop.run_in_executor(self.executor, sock2.connect, ("127.0.0.1", self.port2), self.port1)
+            fut1 = loop.run_in_executor(self.executor, sock1.connect, ("127.0.0.1", self.port))
+            fut2 = loop.run_in_executor(self.executor, sock2.connect, ("127.0.0.1", self.port))
             await fut1
             await fut2
 
