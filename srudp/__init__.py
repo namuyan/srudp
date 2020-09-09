@@ -742,7 +742,7 @@ class SecureReliableSocket(socket):
 
     @property
     def is_closed(self) -> bool:
-        if self.fileno() == -1:
+        if self.receiver_socket.fileno() == -1:
             self.established = False
             atexit.unregister(self.close)
             return True
@@ -753,7 +753,6 @@ class SecureReliableSocket(socket):
             self.established = False
             p = Packet(CONTROL_FIN, CYC_INT0, 0, time(), b'closed')
             self.sendto(self._encrypt(packet2bin(p)), self.address)
-            sleep(0.001)
             self.receiver_socket.close()
             super().close()
             if self.sender_socket_optional is not None:
