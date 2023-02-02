@@ -183,12 +183,12 @@ def get_formal_address_format(address: _WildAddress, family: int = s.AF_INET) ->
 
 class SecureReliableSocket(socket):
     __slots__ = [
-        "timeout", "span", "address", "shared_key", "mtu_size",
+        "timeout", "span", "encryption", "address", "shared_key", "mtu_size",
         "sender_seq", "sender_buffer", "sender_signal", "sender_buffer_lock", "sender_socket_optional",
         "receiver_seq", "receiver_unread_size", "receiver_socket",
         "broadcast_hook_fnc", "loss", "try_connect", "established"]
 
-    def __init__(self, family: int = s.AF_INET, timeout: float = 21.0, span: float = 3.0) -> None:
+    def __init__(self, family: int = s.AF_INET, timeout: float = 21.0, span: float = 3.0, encryption: bool = True) -> None:
         """
         :param family: socket type AF_INET or AF_INET6
         :param timeout: auto socket close by the time passed (sec)
@@ -203,8 +203,10 @@ class SecureReliableSocket(socket):
         # inner params
         self.timeout = timeout
         self.span = span
+        self.encryption = encryption
         self.address: _Address = None
-        self.shared_key: bytes = None
+        if self.encryption:
+            self.shared_key: bytes = None
         self.mtu_size = 0  # 1472b
 
         # sender params
@@ -281,21 +283,22 @@ class SecureReliableSocket(socket):
         self.address = address = tuple(conn_addr)
         log.debug("try to communicate addr={} bind={}".format(address, bind_addr))
 
-        # warning: allow only 256bit curve
-        select_curve = ecdsa.curves.NIST256p
-        log.debug("select curve {} (static)".format(select_curve))
-        assert select_curve.baselen == 32, ("curve is 256bits size only", select_curve)
+        if self.encryption:
+            # warning: allow only 256bit curve
+            select_curve = ecdsa.curves.NIST256p
+            log.debug("select curve {} (static)".format(select_curve))
+            assert select_curve.baselen == 32, ("curve is 256bits size only", select_curve)
+
+            # my secret & public key
+            my_sk = ecdsa.SigningKey.generate(select_curve)
+            my_pk = my_sk.get_verifying_key()
+
+            # other's public key
+            other_pk: Optional[ecdsa.VerifyingKey] = None
 
         # 1. UDP hole punching
         punch_msg = b"udp hole punching"
-        self.sendto(S_HOLE_PUNCHING + punch_msg + select_curve.name.encode(), address)
-
-        # my secret & public key
-        my_sk = ecdsa.SigningKey.generate(select_curve)
-        my_pk = my_sk.get_verifying_key()
-
-        # other's public key
-        other_pk: Optional[ecdsa.VerifyingKey] = None
+        self.sendto(S_HOLE_PUNCHING + punch_msg + (select_curve.name.encode() if self.encryption else b''), address)
 
         check_msg = b"success hand shake"
         for _ in range(int(self.timeout / self.span)):
@@ -305,15 +308,22 @@ class SecureReliableSocket(socket):
                 stage, data = data[:1], data[1:]
 
                 if stage == S_HOLE_PUNCHING:
-                    # 2. send my public key
-                    curve_name = data.replace(punch_msg, b'').decode()
-                    other_curve = find_ecdhe_curve(curve_name)
-                    assert select_curve == other_curve, ("different curve", select_curve, other_curve)
-                    select_curve = find_ecdhe_curve(curve_name)
-                    self.sendto(S_SEND_PUBLIC_KEY + my_pk.to_string(), address)
+                    if self.encryption:
+                        # 2. send my public key
+                        curve_name = data.replace(punch_msg, b'').decode()
+                        other_curve = find_ecdhe_curve(curve_name)
+                        assert select_curve == other_curve, ("different curve", select_curve, other_curve)
+                        select_curve = find_ecdhe_curve(curve_name)
+                        self.sendto(S_SEND_PUBLIC_KEY + my_pk.to_string(), address)
+                    else:
+                        self.sendto(S_ESTABLISHED + check_msg, address)
+
                     log.debug("success UDP hole punching")
 
-                elif stage == S_SEND_PUBLIC_KEY:
+                    if not self.encryption:
+                        break
+
+                elif stage == S_SEND_PUBLIC_KEY and self.encryption:
                     # 3. get public key & send shared key
                     other_pk = ecdsa.VerifyingKey.from_string(data, select_curve)
                     shared_point = my_sk.privkey.secret_multiplier * other_pk.pubkey.point
@@ -324,7 +334,7 @@ class SecureReliableSocket(socket):
                     self.sendto(S_SEND_SHARED_KEY + encrypted_data.encode(), address)
                     log.debug("success getting shared key")
 
-                elif stage == S_SEND_SHARED_KEY:
+                elif stage == S_SEND_SHARED_KEY and self.encryption:
                     # 4. decrypt shared key & send hello msg
                     encrypted_data = data.decode().split("+")
                     if other_pk is None:
@@ -352,7 +362,7 @@ class SecureReliableSocket(socket):
 
                 elif stage == S_ESTABLISHED:
                     # 5. check establish by decrypt specific message
-                    decrypt_msg = self._decrypt(data)
+                    decrypt_msg = self._decrypt(data) if self.encryption else data
                     if decrypt_msg != check_msg:
                         raise ConnectionError("failed to check")
                     log.debug("success hand shaking")
@@ -440,19 +450,19 @@ class SecureReliableSocket(socket):
                             self.loss += 1
                             re_packet = Packet(p.control, p.sequence, p.retry+1, time(), p.data)
                             self.sender_buffer[i] = re_packet
-                            self.sendto(self._encrypt(packet2bin(re_packet)), self.address)
+                            self.sendto(self._encrypt(packet2bin(re_packet)) if self.encryption else packet2bin(re_packet), self.address)
                             transmit_limit -= 1
 
             # send ack as ping (stream may be free)
             if self.span < time() - last_ack_time:
                 p = Packet(CONTROL_ACK, self.receiver_seq - 1, 0, time(), b'as ping')
-                self.sendto(self._encrypt(packet2bin(p)), self.address)
+                self.sendto(self._encrypt(packet2bin(p)) if self.encryption else packet2bin(p), self.address)
                 last_ack_time = time()
 
             # connection may be broken
             if self.timeout < time() - last_receive_time:
                 p = Packet(CONTROL_FIN, CYC_INT0, 0, time(), b'stream may be broken')
-                self.sendto(self._encrypt(packet2bin(p)), self.address)
+                self.sendto(self._encrypt(packet2bin(p)) if self.encryption else packet2bin(p), self.address)
                 break
 
             # just socket select timeout (no data received yet)
@@ -463,7 +473,7 @@ class SecureReliableSocket(socket):
 
             try:
                 data, _addr = self.receiver_socket.recvfrom(65536)
-                packet = bin2packet(self._decrypt(data))
+                packet = bin2packet(self._decrypt(data) if self.encryption else data)
 
                 last_receive_time = time()
                 # log.debug("r<< %s", packet)
@@ -493,7 +503,7 @@ class SecureReliableSocket(socket):
             # receive reset
             if packet.control & CONTROL_FIN:
                 p = Packet(CONTROL_FIN, CYC_INT0, 0, time(), b'be notified fin or reset')
-                self.sendto(self._encrypt(packet2bin(p)), self.address)
+                self.sendto(self._encrypt(packet2bin(p)) if self.encryption else packet2bin(p), self.address)
                 break
 
             # asked re-transmission
@@ -503,7 +513,7 @@ class SecureReliableSocket(socket):
                         if p.sequence == packet.sequence:
                             re_packet = Packet(p.control, p.sequence, p.retry+1, time(), p.data)
                             self.sender_buffer[i] = re_packet
-                            self.sendto(self._encrypt(packet2bin(re_packet)), self.address)
+                            self.sendto(self._encrypt(packet2bin(re_packet)) if self.encryption else packet2bin(re_packet), self.address)
                             retransmitted.append(packet.time)
                             break
                 continue
@@ -536,7 +546,7 @@ class SecureReliableSocket(socket):
                     if p.time < limit:
                         re_packet = Packet(CONTROL_RTM, p.sequence, p.retry+1, time(), b'')
                         retransmit_packets[i] = re_packet
-                        self.sendto(self._encrypt(packet2bin(re_packet)), self.address)
+                        self.sendto(self._encrypt(packet2bin(re_packet)) if self.encryption else packet2bin(re_packet), self.address)
                         self.loss += 1
                         break
 
@@ -554,7 +564,7 @@ class SecureReliableSocket(socket):
                             break  # already pushed request
                     else:
                         re_packet = Packet(CONTROL_RTM, lost_sequence, 0, time(), b'')
-                        self.sendto(self._encrypt(packet2bin(re_packet)), self.address)
+                        self.sendto(self._encrypt(packet2bin(re_packet)) if self.encryption else packet2bin(re_packet), self.address)
                         self.loss += 1
                         retransmit_packets.append(re_packet)
                 else:
@@ -570,7 +580,7 @@ class SecureReliableSocket(socket):
                             continue  # too early to RTM
                         re_packet = Packet(CONTROL_RTM, p.sequence, p.retry+1, time(), b'')
                         retransmit_packets[i] = re_packet
-                        self.sendto(self._encrypt(packet2bin(re_packet)), self.address)
+                        self.sendto(self._encrypt(packet2bin(re_packet)) if self.encryption else packet2bin(re_packet), self.address)
                         self.loss += 1
 
             # fix packet order & push buffer
@@ -585,7 +595,7 @@ class SecureReliableSocket(socket):
             if packet.control & CONTROL_PSH:
                 # send ack
                 p = Packet(CONTROL_ACK, self.receiver_seq - 1, 0, time(), b'put buffer')
-                self.sendto(self._encrypt(packet2bin(p)), self.address)
+                self.sendto(self._encrypt(packet2bin(p)) if self.encryption else packet2bin(p), self.address)
                 last_ack_time = time()
                 # log.debug("pushed! buffer %d %s", len(retransmit_packets), retransmit_packets)
 
@@ -644,7 +654,7 @@ class SecureReliableSocket(socket):
             with self.sender_buffer_lock:
                 packet = Packet(control, self.sender_seq, 0, time(), throw.tobytes())
                 self.sender_buffer.append(packet)
-                self.sendto(self._encrypt(packet2bin(packet)), self.address)
+                self.sendto(self._encrypt(packet2bin(packet)) if self.encryption else packet2bin(packet), self.address)
                 self.sender_seq += 1
             send_size += len(throw)
 
@@ -694,7 +704,7 @@ class SecureReliableSocket(socket):
         #    raise ValueError("data is too big {}<{}".format(window_size, len(data)))
         packet = Packet(CONTROL_BCT, CYC_INT0, 0, time(), data)
         with self.sender_buffer_lock:
-            self.sendto(self._encrypt(packet2bin(packet)), self.address)
+            self.sendto(self._encrypt(packet2bin(packet)) if self.encryption else packet2bin(packet), self.address)
 
     def recv(self, buflen: int = 1024, flags: int = 0) -> bytes:
         assert flags == 0, "unrecognized flags"
@@ -754,7 +764,7 @@ class SecureReliableSocket(socket):
         if self.established:
             self.established = False
             p = Packet(CONTROL_FIN, CYC_INT0, 0, time(), b'closed')
-            self.sendto(self._encrypt(packet2bin(p)), self.address)
+            self.sendto(self._encrypt(packet2bin(p)) if self.encryption else packet2bin(p), self.address)
             self.receiver_socket.close()
             super().close()
             if self.sender_socket_optional is not None:
@@ -798,7 +808,7 @@ def main() -> None:
     sh.setFormatter(formatter)
     logger.addHandler(sh)
 
-    sock = SecureReliableSocket()
+    sock = SecureReliableSocket(encryption=True)
     sock.connect((remote_host, port))
     log.debug("connect success! mtu=%d", sock.mtu_size)
 
