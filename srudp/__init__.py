@@ -678,6 +678,8 @@ class SecureReliableSocket(socket):
                 self.sender_signal.set()
             if self.sender_signal.wait(self.timeout):
                 send_size += self._send(data[send_size:])
+            elif not self.established:
+                raise ConnectionAbortedError('disconnected')
             else:
                 log.debug("waiting for sending buffer have space..")
         log.debug("send operation success %sb", send_size)
