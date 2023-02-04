@@ -75,7 +75,7 @@ FLAG_NAMES = {
 WINDOW_MAX_SIZE = 32768  # 32kb
 SEND_BUFFER_SIZE = WINDOW_MAX_SIZE * 8  # 256kb
 MAX_RETRANSMIT_LIMIT = 4
-FULL_SIZE_PACKET_WAIT = 0.001  # sec
+SENDER_SOCKET_WAIT = 0.001  # sec
 
 # Path MTU Discovery
 IP_MTU = 14
@@ -184,7 +184,7 @@ def get_formal_address_format(address: _WildAddress, family: int = s.AF_INET) ->
 class SecureReliableSocket(socket):
     __slots__ = [
         "timeout", "span", "address", "shared_key", "mtu_size",
-        "sender_seq", "sender_buffer", "sender_signal", "sender_buffer_lock", "sender_socket_optional",
+        "sender_seq", "sender_buffer", "sender_signal", "sender_buffer_lock", "sender_socket_optional", "sender_time",
         "receiver_seq", "receiver_unread_size", "receiver_socket",
         "broadcast_hook_fnc", "loss", "try_connect", "established"]
 
@@ -206,6 +206,7 @@ class SecureReliableSocket(socket):
         self.address: _Address = None
         self.shared_key: bytes = None
         self.mtu_size = 0  # 1472b
+        self.sender_time = 0.0
 
         # sender params
         self.sender_seq = CycInt(1)  # next send sequence
@@ -639,6 +640,11 @@ class SecureReliableSocket(socket):
             if i == length:
                 control |= CONTROL_EOF
 
+            # note: sleep at least SOCKET_WAIT mSec to avoid packet loss
+            space_time = SENDER_SOCKET_WAIT - time() + self.sender_time
+            if 0.0 < space_time:
+                sleep(space_time)
+
             # send one packet
             throw = data[window_size * i:window_size * (i + 1)]
             with self.sender_buffer_lock:
@@ -646,11 +652,8 @@ class SecureReliableSocket(socket):
                 self.sender_buffer.append(packet)
                 self.sendto(self._encrypt(packet2bin(packet)), self.address)
                 self.sender_seq += 1
+            self.sender_time = time()
             send_size += len(throw)
-
-            # note: sleep a mSec to avoid packet loss
-            if window_size == len(throw):
-                sleep(FULL_SIZE_PACKET_WAIT)
 
             # block sendall() when buffer is full
             if buffer_is_full:
