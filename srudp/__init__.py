@@ -506,7 +506,10 @@ class SecureReliableSocket(socket):
                             self.sender_buffer[i] = re_packet
                             self.sendto(self._encrypt(packet2bin(re_packet)), self.address)
                             retransmitted.append(packet.time)
-                            break
+                            break  # success
+                    else:
+                        log.error("cannot find packet to retransmit seq={}".format(packet.sequence))
+                        break
                 continue
 
             # broadcast packet
