@@ -75,6 +75,7 @@ FLAG_NAMES = {
 WINDOW_MAX_SIZE = 32768  # 32kb
 SEND_BUFFER_SIZE = WINDOW_MAX_SIZE * 8  # 256kb
 MAX_RETRANSMIT_LIMIT = 4
+MAX_TEMPORARY_PACKET_SIZE = 50000
 SENDER_SOCKET_WAIT = 0.001  # sec
 
 # Path MTU Discovery
@@ -463,8 +464,11 @@ class SecureReliableSocket(socket):
             """received a packet data"""
 
             try:
-                data, _addr = self.receiver_socket.recvfrom(65536)
-                packet = bin2packet(self._decrypt(data))
+                if self.receiver_seq in temporary:
+                    packet = temporary.pop(self.receiver_seq)
+                else:
+                    data, _addr = self.receiver_socket.recvfrom(65536)
+                    packet = bin2packet(self._decrypt(data))
 
                 last_receive_time = time()
                 # log.debug("r<< %s", packet)
@@ -481,7 +485,7 @@ class SecureReliableSocket(socket):
             if packet.control & CONTROL_ACK:
                 with self.sender_buffer_lock:
                     if 0 < len(self.sender_buffer):
-                        for i in range(packet.sequence - self.sender_buffer[0].sequence + 1):
+                        for seq in range(self.sender_buffer[0].sequence, packet.sequence + 1):
                             # remove packet that sent and confirmed by ACK
                             self.sender_buffer.popleft()
                             if len(self.sender_buffer) == 0:
@@ -551,39 +555,34 @@ class SecureReliableSocket(socket):
             elif packet.sequence > self.receiver_seq:
                 temporary[packet.sequence] = packet
                 # ask re-transmission if not found before packet
-                lost_sequence = packet.sequence - 1
-                if lost_sequence not in temporary:
+                if MAX_TEMPORARY_PACKET_SIZE < len(temporary):
+                    log.error("too many temporary packets stored")
+                    break
+
+                # check self.receiver_seq to packet.sequence for each
+                for lost_seq in map(CycInt, range(packet.sequence - 1, self.receiver_seq - 1, -1)):
+                    if lost_seq in temporary:
+                        continue  # already received packet
                     for p in retransmit_packets:
-                        if p.sequence == lost_sequence:
+                        if p.sequence == lost_seq:
                             break  # already pushed request
                     else:
-                        re_packet = Packet(CONTROL_RTM, lost_sequence, 0, time(), b'')
+                        re_packet = Packet(CONTROL_RTM, lost_seq, 0, time(), b'')
                         self.sendto(self._encrypt(packet2bin(re_packet)), self.address)
                         self.loss += 1
                         retransmit_packets.append(re_packet)
-                else:
-                    pass  # do not do anything..
+                        log.debug("ask retransmit seq={}".format(lost_seq))
+
+                # clean temporary
+                if min(temporary.keys()) < self.receiver_seq:
+                    for seq in tuple(temporary.keys()):
+                        if seq < self.receiver_seq:
+                            del temporary[seq]
+
+                log.debug("continue listen socket and reorder packet")
+                continue
             else:
-                pass  # ignore old packet
-
-            # request all lost packets when PSH (end of chunk)
-            if (packet.control & CONTROL_PSH) and 0 < len(retransmit_packets):
-                if 0 < len(retransmit_packets):
-                    for i, p in enumerate(retransmit_packets):
-                        if time() - p.time < self.span:
-                            continue  # too early to RTM
-                        re_packet = Packet(CONTROL_RTM, p.sequence, p.retry+1, time(), b'')
-                        retransmit_packets[i] = re_packet
-                        self.sendto(self._encrypt(packet2bin(re_packet)), self.address)
-                        self.loss += 1
-
-            # fix packet order & push buffer
-            if self.receiver_seq in temporary:
-                for sequence in sorted(temporary):
-                    if sequence == self.receiver_seq:
-                        self.receiver_seq += 1
-                        packet = temporary.pop(sequence)  # warning: over write packet
-                        self._push_receive_buffer(packet.data)
+                continue  # ignore old packet
 
             # push buffer immediately
             if packet.control & CONTROL_PSH:
@@ -613,6 +612,7 @@ class SecureReliableSocket(socket):
         self.receiver_unread_size += len(data)
 
     def _send_buffer_is_full(self) -> bool:
+        assert self.sender_buffer_lock.locked(), 'unlocked send_buffer!'
         return SEND_BUFFER_SIZE < sum(len(p.data) for p in self.sender_buffer)
 
     def get_window_size(self) -> int:
@@ -637,7 +637,8 @@ class SecureReliableSocket(socket):
         for i in range(length + 1):
             # control flag
             control = 0b00000000
-            buffer_is_full = self._send_buffer_is_full()
+            with self.sender_buffer_lock:
+                buffer_is_full = self._send_buffer_is_full()
             if i == length or buffer_is_full:
                 control |= CONTROL_PSH
             if i == length:
@@ -666,7 +667,8 @@ class SecureReliableSocket(socket):
         return send_size
 
     def sendto(self, data: bytes, address: _Address) -> int:  # type: ignore
-        """note: sendto() after bind() with different port cause OSError on recvfrom()"""
+        """row-level method: guarded by `sender_buffer_lock`, don't use.."""
+        # note: sendto() after bind() with different port cause OSError on recvfrom()
         if self.is_closed:
             return 0
         elif self.sender_socket_optional is None:
@@ -680,8 +682,9 @@ class SecureReliableSocket(socket):
         send_size = 0
         data = memoryview(data)
         while send_size < len(data):
-            if not self._send_buffer_is_full():
-                self.sender_signal.set()
+            with self.sender_buffer_lock:
+                if not self._send_buffer_is_full():
+                    self.sender_signal.set()
             if self.sender_signal.wait(self.timeout):
                 send_size += self._send(data[send_size:])
             elif not self.established:
