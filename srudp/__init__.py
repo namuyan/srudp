@@ -33,14 +33,13 @@ note
 * sharedPoint is calculated by multiply secretKey with publicKey.
 * sharedKey is random 256bit bytes, don't use sharedPoint as sharedKey.
 """
-from typing import NamedTuple, Optional, Union, Deque, Tuple, Callable, Any
+from typing import TYPE_CHECKING, NamedTuple, Optional, Union, Deque, Tuple, Dict, Callable, Any
 from select import select
 from time import sleep, time
 from collections import deque
 from hashlib import sha256
 from binascii import a2b_hex
 from Cryptodome.Cipher import AES
-from Cryptodome.Cipher._mode_gcm import GcmMode
 from struct import Struct
 from socket import socket
 import socket as s
@@ -91,9 +90,13 @@ S_SEND_SHARED_KEY = b'\x02'
 S_ESTABLISHED = b'\x03'
 
 # typing
-_Address = Tuple[Any, ...]
-_WildAddress = Union[_Address, str, bytes]
-_BroadcastHook = Callable[['Packet', 'SecureReliableSocket'], None]
+if TYPE_CHECKING:
+    from Cryptodome.Cipher._mode_gcm import GcmMode
+    from _typeshed import ReadableBuffer
+    from typing import Sized
+    _Address = Tuple[Any, ...]
+    _WildAddress = Union[_Address, str, bytes]
+    _BroadcastHook = Callable[['Packet', 'SecureReliableSocket'], None]
 
 
 class CycInt(int):
@@ -173,7 +176,7 @@ def packet2bin(p: Packet) -> bytes:
     return packet_struct.pack(p.control, int(p.sequence), p.retry, p.time) + p.data
 
 
-def get_formal_address_format(address: _WildAddress, family: int = s.AF_INET) -> _Address:
+def get_formal_address_format(address: '_WildAddress', family: int = s.AF_INET) -> '_Address':
     """tuple of ipv4/6 correct address format"""
     assert isinstance(address, tuple), "cannot recognize bytes or str format"
     for _, _, _, _, addr in s.getaddrinfo(str(address[0]), int(address[1]), family, s.SOCK_STREAM):
@@ -184,7 +187,7 @@ def get_formal_address_format(address: _WildAddress, family: int = s.AF_INET) ->
 
 class SecureReliableSocket(socket):
     __slots__ = [
-        "timeout", "span", "address", "shared_key", "mtu_size",
+        "_timeout", "span", "address", "shared_key", "mtu_size",
         "sender_seq", "sender_buffer", "sender_signal", "sender_buffer_lock", "sender_socket_optional", "sender_time",
         "receiver_seq", "receiver_unread_size", "receiver_socket",
         "broadcast_hook_fnc", "loss", "try_connect", "established"]
@@ -202,9 +205,9 @@ class SecureReliableSocket(socket):
         super().connect(self_address)
 
         # inner params
-        self.timeout = timeout
+        self._timeout = timeout
         self.span = span
-        self.address: _Address = None
+        self.address: '_Address' = None
         self.shared_key: bytes = None
         self.mtu_size = 0  # 1472b
         self.sender_time = 0.0
@@ -223,7 +226,7 @@ class SecureReliableSocket(socket):
 
         # broadcast hook
         # note: don't block this method or backend thread will be broken
-        self.broadcast_hook_fnc: Optional[_BroadcastHook] = None
+        self.broadcast_hook_fnc: Optional['_BroadcastHook'] = None
 
         # status
         self.loss = 0
@@ -242,10 +245,10 @@ class SecureReliableSocket(socket):
         return "<SecureReliableSocket %s %s send=%s recv=%s loss=%s>"\
                % (status, self.address, self.sender_seq, self.receiver_seq, self.loss)
 
-    def bind(self, _address: _WildAddress) -> None:
+    def bind(self, _address: '_WildAddress') -> None:
         raise NotImplementedError("don't use bind() method")
 
-    def connect(self, address: _WildAddress) -> None:
+    def connect(self, address: '_WildAddress') -> None:
         """throw hole-punch msg, listen port and exchange keys"""
         assert not self.established, "already established"
         assert not self.is_closed, "already closed socket"
@@ -300,7 +303,7 @@ class SecureReliableSocket(socket):
         other_pk: Optional[ecdsa.VerifyingKey] = None
 
         check_msg = b"success hand shake"
-        for _ in range(int(self.timeout / self.span)):
+        for _ in range(int(self._timeout / self.span)):
             r, _w, _x = select([self.receiver_socket.fileno()], [], [], self.span)
             if r:
                 data, _addr = self.receiver_socket.recvfrom(1024)
@@ -390,7 +393,7 @@ class SecureReliableSocket(socket):
         receive_size = 0
         my_mut_size = None
         finished_notify = False
-        for _ in range(int(self.timeout/wait)):
+        for _ in range(int(self._timeout / wait)):
             r, _w, _x = select([self.receiver_socket.fileno()], [], [], wait)
             if r:
                 data, _addr = self.receiver_socket.recvfrom(1500)
@@ -420,7 +423,7 @@ class SecureReliableSocket(socket):
 
     def _backend(self) -> None:
         """reorder sequence & fill output buffer"""
-        temporary = dict()
+        temporary: 'Dict[CycInt, Packet]' = dict()
         retransmit_packets: Deque[Packet] = deque()
         retransmitted: Deque[float] = deque(maxlen=16)
         last_packet: Optional[Packet] = None
@@ -452,7 +455,7 @@ class SecureReliableSocket(socket):
                 last_ack_time = time()
 
             # connection may be broken
-            if self.timeout < time() - last_receive_time:
+            if self._timeout < time() - last_receive_time:
                 p = Packet(CONTROL_FIN, CYC_INT0, 0, time(), b'stream may be broken')
                 self.sendto(self._encrypt(packet2bin(p)), self.address)
                 break
@@ -620,9 +623,10 @@ class SecureReliableSocket(socket):
         # Packet = [nonce 16b][tag 16b][static 14b][data xb]
         return self.mtu_size - 32 - packet_struct.size
 
-    def send(self, data: bytes, flags: int = 0) -> int:
+    def send(self, data: 'ReadableBuffer', flags: int = 0) -> int:
         """over write low-level method for compatibility"""
         assert flags == 0, "unrecognized flags"
+        assert isinstance(data, Sized)
         self.sendall(data)
         return len(data)
 
@@ -666,7 +670,7 @@ class SecureReliableSocket(socket):
                 break
         return send_size
 
-    def sendto(self, data: bytes, address: _Address) -> int:  # type: ignore
+    def sendto(self, data: 'ReadableBuffer', address: '_Address') -> int:  # type: ignore
         """row-level method: guarded by `sender_buffer_lock`, don't use.."""
         # note: sendto() after bind() with different port cause OSError on recvfrom()
         if self.is_closed:
@@ -676,7 +680,7 @@ class SecureReliableSocket(socket):
         else:
             return self.sender_socket_optional.sendto(data, address)
 
-    def sendall(self, data: bytes, flags: int = 0) -> None:
+    def sendall(self, data: 'ReadableBuffer', flags: int = 0) -> None:
         """high-level method, use this instead of send()"""
         assert flags == 0, "unrecognized flags"
         send_size = 0
@@ -685,7 +689,7 @@ class SecureReliableSocket(socket):
             with self.sender_buffer_lock:
                 if not self._send_buffer_is_full():
                     self.sender_signal.set()
-            if self.sender_signal.wait(self.timeout):
+            if self.sender_signal.wait(self._timeout):
                 send_size += self._send(data[send_size:])
             elif not self.established:
                 raise ConnectionAbortedError('disconnected')
@@ -723,26 +727,26 @@ class SecureReliableSocket(socket):
 
     def _encrypt(self, data: bytes) -> bytes:
         """encrypt by AES-GCM (more secure than CBC mode)"""
-        cipher: 'GcmMode' = AES.new(self.shared_key, AES.MODE_GCM)  # type: ignore
+        cipher: 'GcmMode' = AES.new(self.shared_key, AES.MODE_GCM)
         # warning: Don't reuse nonce
         enc, tag = cipher.encrypt_and_digest(data)
         # output length = 16bytes + 16bytes + N(=data)bytes
-        return cipher.nonce + tag + enc
+        return bytes(cipher.nonce) + tag + enc
 
     def _decrypt(self, data: bytes) -> bytes:
         """decrypt by AES-GCM (more secure than CBC mode)"""
-        cipher: 'GcmMode' = AES.new(self.shared_key, AES.MODE_GCM, nonce=data[:16])  # type: ignore
+        cipher: 'GcmMode' = AES.new(self.shared_key, AES.MODE_GCM, nonce=data[:16])
         # ValueError raised when verify failed
         return cipher.decrypt_and_verify(data[32:], data[16:32])
 
-    def getsockname(self) -> _Address:
+    def getsockname(self) -> '_Address':
         """self bind info or raise OSError"""
         if self.is_closed:
             raise OSError("socket is closed")
         else:
             return self.receiver_socket.getsockname()  # type: ignore
 
-    def getpeername(self) -> _Address:
+    def getpeername(self) -> '_Address':
         """connection info or raise OSError"""
         if self.is_closed:
             raise OSError("socket is closed")
