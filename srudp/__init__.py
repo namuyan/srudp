@@ -131,7 +131,7 @@ S_ESTABLISHED = b'\x03'
 if TYPE_CHECKING:
     from _typeshed import ReadableBuffer
     _Address = Tuple[Any, ...]
-    _WildAddress = Union[_Address, str, bytes]
+    _WildAddress = Union[_Address, str, ReadableBuffer]
     _BroadcastHook = Callable[['Packet', 'SecureReliableSocket'], None]
 
 
@@ -590,7 +590,12 @@ class SecureReliableSocket(socket):
         for _ in range(int(self._timeout / self.span)):
             r, _w, _x = select([self.receiver_socket.fileno()], [], [], self.span)
             if r:
-                data, _addr = self.receiver_socket.recvfrom(1024)
+                try:
+                    data, _addr = self.receiver_socket.recvfrom(1024)
+                except ConnectionResetError:
+                    # Windows: ICMP port unreachable because the other side isn't listening yet
+                    self.sendto(S_HOLE_PUNCHING + punch_msg + select_curve.name.encode(), address)
+                    continue
                 stage, data = data[:1], data[1:]
 
                 if stage == S_HOLE_PUNCHING:
@@ -678,7 +683,10 @@ class SecureReliableSocket(socket):
         for _ in range(int(self._timeout / wait)):
             r, _w, _x = select([self.receiver_socket.fileno()], [], [], wait)
             if r:
-                data, _addr = self.receiver_socket.recvfrom(1500)
+                try:
+                    data, _addr = self.receiver_socket.recvfrom(1500)
+                except ConnectionResetError:
+                    continue  # Windows: ICMP port unreachable
                 if data.startswith(b'#####'):
                     if len(data) < receive_size:
                         self.sendto(receive_size.to_bytes(4, 'little'), self.address)
