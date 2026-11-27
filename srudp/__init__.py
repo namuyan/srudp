@@ -92,6 +92,9 @@ INITIAL_CWND = 10.0
 MIN_CWND = 2.0
 MAX_CWND = float(SEND_BUFFER_SIZE // 1024)
 CWND_BETA = 0.7  # multiplicative decrease factor on loss
+# HyStart: leave slow start when queueing delay grows (avoid filling buffers until loss)
+HYSTART_MIN_DELAY = 0.004  # sec
+HYSTART_MAX_DELAY = 0.016  # sec
 
 # pacing: spread packets over RTT instead of bursting cwnd at once
 PACING_GAIN_SLOW_START = 2.0
@@ -232,8 +235,13 @@ class CongestionControl(object):
     def in_slow_start(self) -> bool:
         return self.cwnd < self.ssthresh
 
-    def on_ack(self, delivered: int) -> None:
+    def on_ack(self, delivered: int, rtt: 'RttEstimator') -> None:
         if self.in_slow_start:
+            # delay increase: queue is building up, cwnd is enough
+            threshold = min(HYSTART_MAX_DELAY, max(HYSTART_MIN_DELAY, rtt.min_rtt / 8.0))
+            if 32.0 <= self.cwnd and rtt.min_rtt + threshold < rtt.latest:
+                self.ssthresh = self.cwnd
+                return
             self.cwnd += delivered
         else:
             self.cwnd += delivered / self.cwnd
@@ -847,7 +855,7 @@ class SecureReliableSocket(socket):
             self.rack_xmit_ts = rack_xmit_ts
             if 0 < delivered:
                 self.rto_start = now  # restart retransmission timer
-                self.cc.on_ack(delivered)
+                self.cc.on_ack(delivered, self.rtt)
             if 0 < self.sender_sacked:
                 lost_seq = self._detect_lost()
                 if lost_seq is not None:
