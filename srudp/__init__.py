@@ -93,7 +93,6 @@ S_ESTABLISHED = b'\x03'
 if TYPE_CHECKING:
     from Cryptodome.Cipher._mode_gcm import GcmMode
     from _typeshed import ReadableBuffer
-    from typing import Sized
     _Address = Tuple[Any, ...]
     _WildAddress = Union[_Address, str, bytes]
     _BroadcastHook = Callable[['Packet', 'SecureReliableSocket'], None]
@@ -626,9 +625,9 @@ class SecureReliableSocket(socket):
     def send(self, data: 'ReadableBuffer', flags: int = 0) -> int:
         """over write low-level method for compatibility"""
         assert flags == 0, "unrecognized flags"
-        assert isinstance(data, Sized)
+        size = memoryview(data).nbytes
         self.sendall(data)
-        return len(data)
+        return size
 
     def _send(self, data: memoryview) -> int:
         """warning: row-level method"""
