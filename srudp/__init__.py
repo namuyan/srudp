@@ -39,7 +39,7 @@ from time import sleep, time, perf_counter as clock
 from collections import deque, OrderedDict
 from hashlib import sha256
 from binascii import a2b_hex
-from Cryptodome.Cipher import AES
+from Cryptodome.Cipher import ChaCha20_Poly1305
 from struct import Struct, error as StructError
 from socket import socket
 import socket as s
@@ -105,6 +105,11 @@ IP_MTU_DISCOVER = 10
 IP_PMTUDISC_DONT = 0
 IP_PMTUDISC_DO = 2
 
+# encryption: [nonce 24b][tag 16b][encrypted data]
+NONCE_SIZE = 24  # XChaCha20-Poly1305
+TAG_SIZE = 16
+CIPHER_OVERHEAD = NONCE_SIZE + TAG_SIZE
+
 # connection stage
 S_HOLE_PUNCHING = b'\x00'
 S_SEND_PUBLIC_KEY = b'\x01'
@@ -113,7 +118,6 @@ S_ESTABLISHED = b'\x03'
 
 # typing
 if TYPE_CHECKING:
-    from Cryptodome.Cipher._mode_gcm import GcmMode
     from _typeshed import ReadableBuffer
     _Address = Tuple[Any, ...]
     _WildAddress = Union[_Address, str, bytes]
@@ -904,8 +908,8 @@ class SecureReliableSocket(socket):
 
     def get_window_size(self) -> int:
         """maximum size of data you can send at once"""
-        # Packet = [nonce 16b][tag 16b][static 14b][data xb]
-        return self.mtu_size - 32 - packet_struct.size
+        # Packet = [nonce 24b][tag 16b][static 14b][data xb]
+        return self.mtu_size - CIPHER_OVERHEAD - packet_struct.size
 
     def send(self, data: 'ReadableBuffer', flags: int = 0) -> int:
         """over write low-level method for compatibility"""
@@ -1008,18 +1012,23 @@ class SecureReliableSocket(socket):
                 return b""
 
     def _encrypt(self, data: bytes) -> bytes:
-        """encrypt by AES-GCM (more secure than CBC mode)"""
-        cipher: 'GcmMode' = AES.new(self.shared_key, AES.MODE_GCM)
-        # warning: Don't reuse nonce
+        """
+        encrypt by XChaCha20-Poly1305 (AEAD)
+        192bit random nonce is safe to generate for each packet (no counter required)
+        and about twice as fast as AES-GCM on PyCryptodome because GCM needs a costly setup per nonce
+        """
+        nonce = os.urandom(NONCE_SIZE)
+        cipher = ChaCha20_Poly1305.new(key=self.shared_key, nonce=nonce)
         enc, tag = cipher.encrypt_and_digest(data)
-        # output length = 16bytes + 16bytes + N(=data)bytes
-        return bytes(cipher.nonce) + tag + enc
+        # output length = 24bytes + 16bytes + N(=data)bytes
+        return nonce + tag + enc
 
     def _decrypt(self, data: bytes) -> bytes:
-        """decrypt by AES-GCM (more secure than CBC mode)"""
-        cipher: 'GcmMode' = AES.new(self.shared_key, AES.MODE_GCM, nonce=data[:16])
-        # ValueError raised when verify failed
-        return cipher.decrypt_and_verify(data[32:], data[16:32])
+        """decrypt by XChaCha20-Poly1305, ValueError raised when verify failed"""
+        if len(data) < CIPHER_OVERHEAD:
+            raise ValueError("too short data")
+        cipher = ChaCha20_Poly1305.new(key=self.shared_key, nonce=data[:NONCE_SIZE])
+        return cipher.decrypt_and_verify(data[CIPHER_OVERHEAD:], data[NONCE_SIZE:CIPHER_OVERHEAD])
 
     def getsockname(self) -> '_Address':
         """self bind info or raise OSError"""
