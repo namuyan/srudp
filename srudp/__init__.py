@@ -187,7 +187,7 @@ def get_formal_address_format(address: '_WildAddress', family: int = s.AF_INET) 
 class SecureReliableSocket(socket):
     __slots__ = [
         "_timeout", "span", "address", "shared_key", "mtu_size",
-        "sender_seq", "sender_buffer", "sender_signal", "sender_buffer_lock", "sender_socket_optional", "sender_time",
+        "sender_seq", "sender_buffer", "sender_buffer_bytes", "sender_signal", "sender_buffer_lock", "sender_socket_optional", "sender_time",
         "receiver_seq", "receiver_unread_size", "receiver_socket",
         "broadcast_hook_fnc", "loss", "try_connect", "established"]
 
@@ -214,6 +214,7 @@ class SecureReliableSocket(socket):
         # sender params
         self.sender_seq = CycInt(1)  # next send sequence
         self.sender_buffer: Deque[Packet] = deque()
+        self.sender_buffer_bytes = 0  # total data size in sender_buffer
         self.sender_signal = threading.Event()  # clear when buffer is empty
         self.sender_buffer_lock = threading.Lock()
         self.sender_socket_optional: Optional[socket] = None
@@ -487,11 +488,9 @@ class SecureReliableSocket(socket):
             if packet.control & CONTROL_ACK:
                 with self.sender_buffer_lock:
                     if 0 < len(self.sender_buffer):
-                        for seq in range(self.sender_buffer[0].sequence, packet.sequence + 1):
-                            # remove packet that sent and confirmed by ACK
-                            self.sender_buffer.popleft()
-                            if len(self.sender_buffer) == 0:
-                                break
+                        # remove packets confirmed by ACK (cumulative: all seq <= ack)
+                        while self.sender_buffer and self.sender_buffer[0].sequence <= packet.sequence:
+                            self.sender_buffer_bytes -= len(self.sender_buffer.popleft().data)
                         if not self._send_buffer_is_full():
                             self.sender_signal.set()
                             log.debug("allow sending operation again seq={}".format(packet.sequence))
@@ -615,7 +614,7 @@ class SecureReliableSocket(socket):
 
     def _send_buffer_is_full(self) -> bool:
         assert self.sender_buffer_lock.locked(), 'unlocked send_buffer!'
-        return SEND_BUFFER_SIZE < sum(len(p.data) for p in self.sender_buffer)
+        return SEND_BUFFER_SIZE < self.sender_buffer_bytes
 
     def get_window_size(self) -> int:
         """maximum size of data you can send at once"""
@@ -657,6 +656,7 @@ class SecureReliableSocket(socket):
             with self.sender_buffer_lock:
                 packet = Packet(control, self.sender_seq, 0, time(), throw.tobytes())
                 self.sender_buffer.append(packet)
+                self.sender_buffer_bytes += len(packet.data)
                 self.sendto(self._encrypt(packet2bin(packet)), self.address)
                 self.sender_seq += 1
             self.sender_time = time()
