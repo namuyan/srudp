@@ -48,6 +48,7 @@ import logging
 import atexit
 import ecdsa
 import errno
+import sys
 import os
 
 
@@ -109,9 +110,11 @@ SOCKET_BUFFER_SIZE = 1024 * 1024  # 1mb (OS may limit it smaller)
 
 # Path MTU Discovery
 IP_MTU = 14
-IP_MTU_DISCOVER = 10
+IP_MTU_DISCOVER = 10  # Linux
 IP_PMTUDISC_DONT = 0
 IP_PMTUDISC_DO = 2
+IP_DONTFRAG = 28  # macOS (11+)
+IP_DONTFRAGMENT = 14  # Windows
 
 # encryption: [nonce 24b][tag 16b][encrypted data]
 NONCE_SIZE = 24  # XChaCha20-Poly1305
@@ -401,6 +404,25 @@ def set_socket_buffer_size(sock: socket, size: int = SOCKET_BUFFER_SIZE) -> None
                 request //= 2  # e.g. macOS raise ENOBUFS when over kern.ipc.maxsockbuf
 
 
+def set_dont_fragment(sock: socket, enable: bool) -> bool:
+    """set/clear IPv4 don't-fragment flag, the option differs among OSes (return False if not supported)"""
+    if sock.family != s.AF_INET:
+        return False
+    if sys.platform.startswith("linux"):
+        option, value = IP_MTU_DISCOVER, (IP_PMTUDISC_DO if enable else IP_PMTUDISC_DONT)
+    elif sys.platform == "darwin":
+        option, value = IP_DONTFRAG, int(enable)
+    elif sys.platform == "win32":
+        option, value = IP_DONTFRAGMENT, int(enable)
+    else:
+        return False
+    try:
+        sock.setsockopt(s.IPPROTO_IP, option, value)
+        return True
+    except OSError:
+        return False
+
+
 def get_formal_address_format(address: '_WildAddress', family: int = s.AF_INET) -> '_Address':
     """tuple of ipv4/6 correct address format"""
     assert isinstance(address, tuple), "cannot recognize bytes or str format"
@@ -418,7 +440,7 @@ class SecureReliableSocket(socket):
         "rack_xmit_ts", "rto_start", "tlp_sent", "cc", "pacer",
         "receiver_seq", "receiver_unread_size", "receiver_socket", "receiver_temporary",
         "receiver_ack_pending", "receiver_ack_needed", "receiver_echo_time", "receiver_last_packet", "last_ack_time",
-        "receiver_output",
+        "receiver_output", "receiver_feeder",
         "broadcast_hook_fnc", "loss", "try_connect", "established", "rtt"]
 
     def __init__(self, family: int = s.AF_INET, timeout: float = 21.0, span: float = 3.0) -> None:
@@ -427,11 +449,23 @@ class SecureReliableSocket(socket):
         :param timeout: auto socket close by the time passed (sec)
         :param span: check socket status by the span (sec)
         """
-        # self bind buffer
+        # read buffer: this stream socket is connected to `receiver_feeder` on loopback,
+        # received data is written to the feeder so recv() & select() work like a normal socket
+        # note: don't connect the socket to itself, macOS refuse it with EINVAL (issue #5)
         super().__init__(family, s.SOCK_STREAM)
-        super().bind(("127.0.0.1" if family == s.AF_INET else "::1", 0))
-        self_address = super().getsockname()
-        super().connect(self_address)
+        with socket(family, s.SOCK_STREAM) as listener:
+            listener.bind(("127.0.0.1" if family == s.AF_INET else "::1", 0))
+            listener.listen(8)
+            listener.settimeout(10.0)
+            super().connect(listener.getsockname())
+            self_address = super().getsockname()
+            while True:
+                feeder, feeder_peer = listener.accept()
+                if feeder_peer[:2] == self_address[:2]:
+                    break
+                feeder.close()  # someone else connected to the listener
+        feeder.setblocking(True)
+        self.receiver_feeder = feeder
 
         # inner params
         self._timeout = timeout
@@ -622,11 +656,9 @@ class SecureReliableSocket(socket):
         # get best MUT size
         # set don't-fragment flag & reset after
         # avoid Path MTU Discovery Blackhole
-        if self.family == s.AF_INET:
-            self.receiver_socket.setsockopt(s.IPPROTO_IP, IP_MTU_DISCOVER, IP_PMTUDISC_DO)
+        set_dont_fragment(self.receiver_socket, True)
         self.mtu_size = self._find_mtu_size()
-        if self.family == s.AF_INET:
-            self.receiver_socket.setsockopt(s.IPPROTO_IP, IP_MTU_DISCOVER, IP_PMTUDISC_DONT)
+        set_dont_fragment(self.receiver_socket, False)
         log.debug("success get MUT size %db", self.mtu_size)
 
         # success establish connection
@@ -972,10 +1004,10 @@ class SecureReliableSocket(socket):
             return
         data = b"".join(self.receiver_output)
         self.receiver_output.clear()
-        if self.fileno() == -1:
+        if self.receiver_feeder.fileno() == -1:
             return  # already closed
         try:
-            super().sendall(data)
+            self.receiver_feeder.sendall(data)
         except OSError:
             return  # closed by user
         self.receiver_unread_size += len(data)
@@ -1141,12 +1173,17 @@ class SecureReliableSocket(socket):
         if self.established:
             self.established = False
             p = Packet(CONTROL_FIN, CYC_INT0, 0, time(), b'closed')
-            self.sendto(self._encrypt(packet2bin(p)), self.address)
-            self.receiver_socket.close()
-            super().close()
-            if self.sender_socket_optional is not None:
-                self.sender_socket_optional.close()
-            atexit.unregister(self.close)
+            try:
+                self.sendto(self._encrypt(packet2bin(p)), self.address)
+            except OSError:
+                pass
+        # note: close all inner sockets even if not established (e.g. connect() failed)
+        self.receiver_socket.close()
+        self.receiver_feeder.close()
+        super().close()
+        if self.sender_socket_optional is not None:
+            self.sender_socket_optional.close()
+        atexit.unregister(self.close)
 
 
 def find_ecdhe_curve(curve_name: str) -> ecdsa.curves.Curve:
