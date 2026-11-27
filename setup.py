@@ -31,7 +31,7 @@ setup(
     install_requires=install_requires,
     license="MIT Licence",
     keywords='RUDP UDP P2P hole-punching',
-    python_requires='>=3.6',
+    python_requires='>=3.11',
     classifiers=[
         'Typing :: Typed',
         'Topic :: Internet',
@@ -39,6 +39,10 @@ setup(
         'Topic :: System :: Networking',
         'Development Status :: 3 - Alpha',
         'Programming Language :: Python :: 3',
+        'Programming Language :: Python :: 3 :: Only',
+        'Operating System :: POSIX :: Linux',
+        'Operating System :: MacOS',
+        'Operating System :: Microsoft :: Windows',
         'License :: OSI Approved :: MIT License',
     ],
 )

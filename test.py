@@ -20,7 +20,6 @@ sh.setLevel(logging.DEBUG)
 sh.setFormatter(formatter)
 logger.addHandler(sh)
 
-IS_TRAVIS = os.getenv('TRAVIS') == 'true'
 IS_WINDOWS = os.name == 'nt'
 
 
@@ -191,7 +190,7 @@ class TestSocket(unittest.TestCase):
     def test_ipv6(self):
         logger.info("start test_ipv6()")
         # https://docs.travis-ci.com/user/reference/overview/#virtualisation-environment-vs-operating-system
-        if IS_TRAVIS or not has_ipv6_loopback():
+        if not has_ipv6_loopback():
             self.skipTest("ipv6 isn't supported")
 
         sock1 = SecureReliableSocket(s.AF_INET6)
@@ -215,10 +214,9 @@ class TestSocket(unittest.TestCase):
 
     def test_asyncio(self):
         logger.info("start test_asyncio()")
-        if IS_TRAVIS and IS_WINDOWS:
-            self.skipTest("travis's windows fail stream drain()")
-
-        loop = asyncio.new_event_loop()
+        # note: ProactorEventLoop (Windows default) writes to the socket handle directly
+        # and bypasses SecureReliableSocket.send(), use SelectorEventLoop instead
+        loop = asyncio.SelectorEventLoop() if IS_WINDOWS else asyncio.new_event_loop()
 
         sock1 = SecureReliableSocket()
         sock2 = SecureReliableSocket()
