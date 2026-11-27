@@ -3,7 +3,7 @@ Secure Reliable UDP
 This repository provides **Secure Reliable Data Stream** that works like TCP.  
 My purpose is enable users create P2P connection between clients in closed NAT.
 
-[![Build Status](https://travis-ci.org/namuyan/srudp.svg?branch=master)](https://travis-ci.org/namuyan/srudp)
+[![CI](https://github.com/namuyan/srudp/actions/workflows/ci.yml/badge.svg)](https://github.com/namuyan/srudp/actions/workflows/ci.yml)
 [![Downloads](https://pepy.tech/badge/srudp)](https://pepy.tech/project/srudp)
 
 Features
@@ -18,7 +18,7 @@ Features
 
 Requirement
 ----
-* Python**3.6+**
+* Python**3.11+** (Linux / macOS / Windows)
 * [requirements.txt](requirements.txt)
 
 Installation
