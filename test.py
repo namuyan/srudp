@@ -1,4 +1,5 @@
-from srudp import SecureReliableSocket, Packet
+from srudp import SecureReliableSocket, Packet, sack_blocks, ack_body, parse_ack_body
+from typing import Optional, Tuple, Any
 from concurrent.futures import ThreadPoolExecutor
 from time import sleep
 import socket as s
@@ -31,6 +32,46 @@ def has_ipv6_loopback() -> bool:
         return True
     except OSError:
         return False
+
+
+class LossySocket(SecureReliableSocket):
+    """drop & reorder outgoing datagrams after established (for test)"""
+    __slots__ = ["drop_rate", "reorder_rate", "rand", "holding"]
+
+    def __init__(self, drop_rate: float, reorder_rate: float, seed: int) -> None:
+        super().__init__()
+        self.drop_rate = drop_rate
+        self.reorder_rate = reorder_rate
+        self.rand = random.Random(seed)
+        self.holding: Optional[Tuple[bytes, Any]] = None
+
+    def sendto(self, data, address):  # type: ignore
+        if not self.established:
+            return super().sendto(data, address)
+        x = self.rand.random()
+        if x < self.drop_rate:
+            return len(data)  # lost
+        if self.holding is None and x < self.drop_rate + self.reorder_rate:
+            self.holding = (bytes(data), address)  # send after the next one
+            return len(data)
+        size = super().sendto(data, address)
+        if self.holding is not None:
+            held, self.holding = self.holding, None
+            super().sendto(*held)
+        return size
+
+
+class TestFunctions(unittest.TestCase):
+    def test_sack_blocks(self):
+        assert sack_blocks(10, []) == []
+        assert sack_blocks(10, [12, 13, 14, 20, 22, 21]) == [(12, 14), (20, 22)]
+        # cycle around 0xffffffff
+        assert sack_blocks(0xfffffffe, [0xffffffff, 0, 1, 5]) == [(0xffffffff, 1), (5, 5)]
+        assert sack_blocks(0, [2, 4, 6, 8], limit=2) == [(2, 2), (4, 4)]
+
+    def test_ack_body(self):
+        assert parse_ack_body(ack_body(1.5, [(1, 2), (5, 9)])) == (1.5, [(1, 2), (5, 9)])
+        assert parse_ack_body(b'as ping') == (0.0, [])
 
 
 class TestSocket(unittest.TestCase):
@@ -107,6 +148,34 @@ class TestSocket(unittest.TestCase):
         assert received == data, (len(received), len(data))
 
         # close
+        sock1.close()
+        sock2.close()
+
+    def test_lossy_network(self):
+        logger.info("start test_lossy_network()")
+        # both directions drop 5% & reorder 5% of packets
+        sock1 = LossySocket(0.05, 0.05, seed=1)
+        sock2 = LossySocket(0.05, 0.05, seed=2)
+        sock1.settimeout(10.0)
+
+        fut1 = self.executor.submit(sock1.connect, ("127.0.0.1", self.port))
+        fut2 = self.executor.submit(sock2.connect, ("127.0.0.1", self.port))
+        fut1.result(10.0)
+        fut2.result(10.0)
+
+        size = 2000000
+        data = os.urandom(size)
+        fut = self.executor.submit(sock2.sendall, data)
+        received = bytearray()
+        while len(received) < size:
+            r = sock1.recv(65536)
+            if len(r) == 0:
+                break
+            received += r
+        fut.result(10.0)
+        assert received == data, (len(received), len(data))
+        assert 0 < sock2.loss, sock2
+
         sock1.close()
         sock2.close()
 

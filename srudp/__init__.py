@@ -33,14 +33,14 @@ note
 * sharedPoint is calculated by multiply secretKey with publicKey.
 * sharedKey is random 256bit bytes, don't use sharedPoint as sharedKey.
 """
-from typing import TYPE_CHECKING, NamedTuple, Optional, Union, Deque, Tuple, Dict, Callable, Any
+from typing import TYPE_CHECKING, NamedTuple, Optional, Union, Deque, Tuple, Dict, List, Iterable, Callable, Any
 from select import select
 from time import sleep, time
-from collections import deque
+from collections import deque, OrderedDict
 from hashlib import sha256
 from binascii import a2b_hex
 from Cryptodome.Cipher import AES
-from struct import Struct
+from struct import Struct, error as StructError
 from socket import socket
 import socket as s
 import threading
@@ -52,7 +52,8 @@ import os
 
 log = logging.getLogger(__name__)
 packet_struct = Struct("<BIBd")
-ack_struct = Struct("<d")  # ACK body: [echo time 8b] (sender's time of the packet that triggered it)
+ack_struct = Struct("<dB")  # ACK body: [echo time 8b][number of SACK blocks 1b]
+sack_struct = Struct("<II")  # SACK block: [first seq 4b][last seq 4b] (both inclusive)
 
 CONTROL_ACK = 0b00000001  # Acknowledge
 CONTROL_PSH = 0b00000010  # Push data immediately
@@ -74,8 +75,11 @@ FLAG_NAMES = {
 }
 WINDOW_MAX_SIZE = 32768  # 32kb
 SEND_BUFFER_SIZE = WINDOW_MAX_SIZE * 8  # 256kb
-MAX_RETRANSMIT_LIMIT = 4
 MAX_TEMPORARY_PACKET_SIZE = 50000
+RECEIVE_BATCH_SIZE = 64  # max datagrams read at once before acknowledging
+ACK_EVERY = 4  # acknowledge at least every N in-order packets
+MAX_SACK_BLOCKS = 32  # max SACK blocks in one ACK
+MIN_REORDER_WINDOW = 0.001  # sec, packet sent this earlier than a delivered one is lost
 
 # retransmission timeout (RFC 6298)
 INITIAL_RTO = 1.0  # sec
@@ -194,16 +198,63 @@ class RttEstimator(object):
         return min(MAX_RTO, max(MIN_RTO, base) * self.backoff)
 
 
-def ack_body(echo_time: float) -> bytes:
-    return ack_struct.pack(echo_time)
+def ack_body(echo_time: float, blocks: 'List[Tuple[int, int]]') -> bytes:
+    """
+    [echo time 8b][number of blocks 1b]([first seq 4b][last seq 4b])*n
+    echo time: time field of the packet triggered this ACK (0.0 is no RTT sample)
+    blocks: received sequence ranges above cumulative ACK (selective ACK)
+    """
+    return ack_struct.pack(echo_time, len(blocks)) + b"".join(sack_struct.pack(a, b) for a, b in blocks)
 
 
-def parse_ack_body(data: bytes) -> float:
-    """return echo time (0.0 means no RTT sample)"""
+def parse_ack_body(data: bytes) -> 'Tuple[float, List[Tuple[int, int]]]':
     if len(data) < ack_struct.size:
-        return 0.0
-    echo_time, = ack_struct.unpack_from(data)
-    return float(echo_time)
+        return 0.0, []
+    echo_time, number = ack_struct.unpack_from(data)
+    blocks: 'List[Tuple[int, int]]' = list()
+    for i in range(number):
+        offset = ack_struct.size + i * sack_struct.size
+        if len(data) < offset + sack_struct.size:
+            break
+        first, last = sack_struct.unpack_from(data, offset)
+        blocks.append((first, last))
+    return float(echo_time), blocks
+
+
+def sack_blocks(base: int, received: 'Iterable[int]', limit: int = MAX_SACK_BLOCKS) -> 'List[Tuple[int, int]]':
+    """continuous ranges of received sequences above `base` (cycle aware), nearest first"""
+    offsets = sorted((int(seq) - base) % 0x100000000 for seq in received)
+    blocks: 'List[Tuple[int, int]]' = list()
+    start = prev = -2
+    for offset in offsets:
+        if offset == prev + 1:
+            prev = offset
+            continue
+        if 0 <= start:
+            blocks.append(((base + start) % 0x100000000, (base + prev) % 0x100000000))
+            if limit <= len(blocks):
+                return blocks
+        start = prev = offset
+    if 0 <= start:
+        blocks.append(((base + start) % 0x100000000, (base + prev) % 0x100000000))
+    return blocks
+
+
+class _Segment(object):
+    """sent packet waiting for ACK"""
+    __slots__ = ["control", "sequence", "data", "xmit_time", "retry", "sacked", "lost"]
+
+    def __init__(self, control: int, sequence: CycInt, data: bytes, xmit_time: float) -> None:
+        self.control = control
+        self.sequence = sequence
+        self.data = data
+        self.xmit_time = xmit_time  # last (re)transmission time
+        self.retry = 0
+        self.sacked = False  # received by peer (selective ACK)
+        self.lost = False  # marked lost & waiting for retransmission
+
+    def to_packet(self) -> 'Packet':
+        return Packet(self.control, self.sequence, self.retry, self.xmit_time, self.data)
 
 
 class Packet(NamedTuple):
@@ -245,8 +296,11 @@ def get_formal_address_format(address: '_WildAddress', family: int = s.AF_INET) 
 class SecureReliableSocket(socket):
     __slots__ = [
         "_timeout", "span", "address", "shared_key", "mtu_size",
-        "sender_seq", "sender_buffer", "sender_buffer_bytes", "sender_signal", "sender_buffer_lock", "sender_socket_optional", "sender_time",
-        "receiver_seq", "receiver_unread_size", "receiver_socket",
+        "sender_seq", "sender_buffer", "sender_buffer_bytes", "sender_buffer_lock", "sender_cond",
+        "sender_sacked", "sender_lost", "sender_lost_queue", "sender_socket_optional", "sender_time",
+        "rack_xmit_ts", "rto_start",
+        "receiver_seq", "receiver_unread_size", "receiver_socket", "receiver_temporary",
+        "receiver_ack_pending", "receiver_ack_needed", "receiver_echo_time", "receiver_last_packet", "last_ack_time",
         "broadcast_hook_fnc", "loss", "try_connect", "established", "rtt"]
 
     def __init__(self, family: int = s.AF_INET, timeout: float = 21.0, span: float = 3.0) -> None:
@@ -271,16 +325,27 @@ class SecureReliableSocket(socket):
 
         # sender params
         self.sender_seq = CycInt(1)  # next send sequence
-        self.sender_buffer: Deque[Packet] = deque()
+        self.sender_buffer: 'OrderedDict[int, _Segment]' = OrderedDict()  # sent & not ACKed yet
         self.sender_buffer_bytes = 0  # total data size in sender_buffer
-        self.sender_signal = threading.Event()  # clear when buffer is empty
         self.sender_buffer_lock = threading.Lock()
+        self.sender_cond = threading.Condition(self.sender_buffer_lock)  # notified when buffer has space
+        self.sender_sacked = 0  # number of SACKed segments in sender_buffer
+        self.sender_lost = 0  # number of segments marked lost (not retransmitted yet)
+        self.sender_lost_queue: Deque[int] = deque()  # sequences to retransmit
         self.sender_socket_optional: Optional[socket] = None
+        self.rack_xmit_ts = 0.0  # transmission time of the most recently delivered segment (RACK)
+        self.rto_start = 0.0  # retransmission timer started at
 
         # receiver params
         self.receiver_seq = CycInt(1)  # next receive sequence
         self.receiver_unread_size = 0
         self.receiver_socket = socket(family, s.SOCK_DGRAM)
+        self.receiver_temporary: 'Dict[CycInt, Packet]' = dict()  # out-of-order packets
+        self.receiver_ack_pending = 0  # in-order packets not acknowledged yet
+        self.receiver_ack_needed = False  # should send ACK immediately (gap, duplicate or PSH)
+        self.receiver_echo_time = 0.0  # time field of the last received data packet
+        self.receiver_last_packet: Optional[Packet] = None
+        self.last_ack_time = 0.0
 
         # broadcast hook
         # note: don't block this method or backend thread will be broken
@@ -483,200 +548,250 @@ class SecureReliableSocket(socket):
             raise ConnectionError("timeout on finding MUT size")
 
     def _backend(self) -> None:
-        """reorder sequence & fill output buffer"""
-        temporary: 'Dict[CycInt, Packet]' = dict()
-        retransmit_packets: Deque[Packet] = deque()
-        retransmitted: Deque[float] = deque(maxlen=16)
-        last_packet: Optional[Packet] = None
+        """receive packets, reorder sequence, fill output buffer & manage retransmission"""
         last_receive_time = time()
-        last_ack_time = time()
+        self.last_ack_time = time()
+        self.receiver_socket.setblocking(False)
+        closing = False
 
-        while not self.is_closed:
+        while not closing and not self.is_closed:
             # wake up often enough to check the retransmission timer
             select_timeout = min(self.span, self.rtt.rto / 4.0) if self.sender_buffer else self.span
-            r, _w, _x = select([self.receiver_socket.fileno()], [], [], select_timeout)
+            try:
+                r, _w, _x = select([self.receiver_socket.fileno()], [], [], select_timeout)
+            except (OSError, ValueError):
+                break  # socket closed
+            now = time()
 
-            # re-transmit (retransmission timeout)
-            if 0 < len(self.sender_buffer):
-                with self.sender_buffer_lock:
-                    now = time() - self.rtt.rto
-                    transmit_limit = MAX_RETRANSMIT_LIMIT  # max transmit at once
-                    for i, p in enumerate(self.sender_buffer):
-                        if transmit_limit == 0:
-                            break
-                        if p.time < now:
-                            self.loss += 1
-                            re_packet = Packet(p.control, p.sequence, min(255, p.retry+1), time(), p.data)
-                            self.sender_buffer[i] = re_packet
-                            self.sendto(self._encrypt(packet2bin(re_packet)), self.address)
-                            transmit_limit -= 1
-                    if transmit_limit < MAX_RETRANSMIT_LIMIT:
-                        self.rtt.on_timeout()  # exponential backoff
+            # retransmission timeout
+            self._check_retransmit_timeout(now)
 
             # send ack as ping (stream may be free)
-            if self.span < time() - last_ack_time:
-                p = Packet(CONTROL_ACK, self.receiver_seq - 1, 0, time(), ack_body(0.0))
-                self.sendto(self._encrypt(packet2bin(p)), self.address)
-                last_ack_time = time()
+            if self.span < now - self.last_ack_time:
+                self._send_ack(0.0)
 
             # connection may be broken
-            if self._timeout < time() - last_receive_time:
-                p = Packet(CONTROL_FIN, CYC_INT0, 0, time(), b'stream may be broken')
-                self.sendto(self._encrypt(packet2bin(p)), self.address)
+            if self._timeout < now - last_receive_time:
+                self._send_control(CONTROL_FIN, b'stream may be broken')
                 break
 
             # just socket select timeout (no data received yet)
             if len(r) == 0:
                 continue
 
-            """received a packet data"""
-
-            try:
-                data, _addr = self.receiver_socket.recvfrom(65536)
-                packet = bin2packet(self._decrypt(data))
-
+            # read datagrams queued in the socket
+            for _ in range(RECEIVE_BATCH_SIZE):
+                try:
+                    data, _addr = self.receiver_socket.recvfrom(65536)
+                except BlockingIOError:
+                    break  # socket is empty
+                except ConnectionResetError:
+                    continue  # ICMP port unreachable (Windows)
+                except OSError:
+                    closing = True
+                    break
+                try:
+                    packet = bin2packet(self._decrypt(data))
+                except (ValueError, StructError):
+                    continue  # decrypt failed or broken packet
                 last_receive_time = time()
-                # log.debug("r<< %s", packet)
-            except ValueError:
-                # log.debug("decrypt failed len=%s..".format(data[:10]))
-                continue
-            except (ConnectionResetError, OSError):
-                break
-            except Exception:
-                log.error("UDP socket closed", exc_info=True)
-                break
-
-            # receive ack
-            if packet.control & CONTROL_ACK:
-                echo_time = parse_ack_body(packet.data)
-                if 0.0 < echo_time:
-                    self.rtt.update(time() - echo_time)
-                with self.sender_buffer_lock:
-                    if 0 < len(self.sender_buffer):
-                        # remove packets confirmed by ACK (cumulative: all seq <= ack)
-                        while self.sender_buffer and self.sender_buffer[0].sequence <= packet.sequence:
-                            self.sender_buffer_bytes -= len(self.sender_buffer.popleft().data)
-                        if not self._send_buffer_is_full():
-                            self.sender_signal.set()
-                            log.debug("allow sending operation again seq={}".format(packet.sequence))
-                continue
-
-            # receive reset
-            if packet.control & CONTROL_FIN:
-                p = Packet(CONTROL_FIN, CYC_INT0, 0, time(), b'be notified fin or reset')
-                self.sendto(self._encrypt(packet2bin(p)), self.address)
-                break
-
-            # asked re-transmission
-            if packet.control & CONTROL_RTM:
-                with self.sender_buffer_lock:
-                    for i, p in enumerate(self.sender_buffer):
-                        if p.sequence == packet.sequence:
-                            re_packet = Packet(p.control, p.sequence, min(255, p.retry+1), time(), p.data)
-                            self.sender_buffer[i] = re_packet
-                            self.sendto(self._encrypt(packet2bin(re_packet)), self.address)
-                            retransmitted.append(packet.time)
-                            break  # success
-                    else:
-                        log.error("cannot find packet to retransmit seq={}".format(packet.sequence))
-                        break
-                continue
-
-            # broadcast packet
-            if packet.control & CONTROL_BCT:
-                if self.broadcast_hook_fnc is not None:
-                    self.broadcast_hook_fnc(packet, self)
-                elif last_packet is None or last_packet.control & CONTROL_EOF:
-                    self._push_receive_buffer(packet.data)
-                else:
-                    # note: acquire realtime response
-                    log.debug("throw away %s", packet)
-                continue
-
-            """normal packet from here (except PSH, EOF)"""
-
-            # check the packet is retransmitted
-            if 0 < packet.retry and 0 < len(retransmit_packets):
-                limit = time() - self.span
-                for i, p in enumerate(retransmit_packets):
-                    if p.sequence == packet.sequence:
-                        del retransmit_packets[i]
-                        break  # success retransmitted
-                    if p.sequence < self.receiver_seq:
-                        del retransmit_packets[i]
-                        break  # already received
-                for i, p in enumerate(retransmit_packets):
-                    # too old retransmission request
-                    if p.time < limit:
-                        re_packet = Packet(CONTROL_RTM, p.sequence, p.retry+1, time(), b'')
-                        retransmit_packets[i] = re_packet
-                        self.sendto(self._encrypt(packet2bin(re_packet)), self.address)
-                        self.loss += 1
-                        break
-
-            # receive data
-            if packet.sequence == self.receiver_seq:
-                self.receiver_seq += 1
-                self._push_receive_buffer(packet.data)
-                # drain packets that arrived early and are in order now
-                control = packet.control
-                while self.receiver_seq in temporary:
-                    packet = temporary.pop(self.receiver_seq)
-                    control |= packet.control
-                    self.receiver_seq += 1
-                    self._push_receive_buffer(packet.data)
-                packet = Packet(control, packet.sequence, packet.retry, packet.time, packet.data)
-            elif packet.sequence > self.receiver_seq:
-                temporary[packet.sequence] = packet
-                # ask re-transmission if not found before packet
-                if MAX_TEMPORARY_PACKET_SIZE < len(temporary):
-                    log.error("too many temporary packets stored")
+                if not self._on_packet(packet):
+                    closing = True
                     break
 
-                # check self.receiver_seq to packet.sequence for each
-                for lost_seq in map(CycInt, range(packet.sequence - 1, self.receiver_seq - 1, -1)):
-                    if lost_seq in temporary:
-                        continue  # already received packet
-                    for p in retransmit_packets:
-                        if p.sequence == lost_seq:
-                            break  # already pushed request
-                    else:
-                        re_packet = Packet(CONTROL_RTM, lost_seq, 0, time(), b'')
-                        self.sendto(self._encrypt(packet2bin(re_packet)), self.address)
-                        self.loss += 1
-                        retransmit_packets.append(re_packet)
-                        log.debug("ask retransmit seq={}".format(lost_seq))
-
-                # clean temporary
-                if min(temporary.keys()) < self.receiver_seq:
-                    for seq in tuple(temporary.keys()):
-                        if seq < self.receiver_seq:
-                            del temporary[seq]
-
-                log.debug("continue listen socket and reorder packet")
-                continue
-            else:
-                continue  # ignore old packet
-
-            # push buffer immediately
-            if packet.control & CONTROL_PSH:
-                # send ack
-                p = Packet(CONTROL_ACK, self.receiver_seq - 1, 0, time(), ack_body(packet.time))
-                self.sendto(self._encrypt(packet2bin(p)), self.address)
-                last_ack_time = time()
-                # log.debug("pushed! buffer %d %s", len(retransmit_packets), retransmit_packets)
-
-            # reached EOF & push broadcast packets
-            if packet.control & CONTROL_EOF:
-                # note: stopped sending broadcast packet after main stream for realtime
-                log.debug("reached end of chunk seq={}".format(packet.sequence))
-
-            # update last packet
-            last_packet = packet
+            # acknowledge received packets at once
+            if not closing and (self.receiver_ack_needed or 0 < self.receiver_ack_pending):
+                self._send_ack(self.receiver_echo_time)
 
         # close
         log.debug("srudp socket is closing now")
         self.close()
+
+    def _on_packet(self, packet: Packet) -> bool:
+        """handle received packet, return False when close"""
+        # receive ack
+        if packet.control & CONTROL_ACK:
+            self._on_ack(packet)
+            return True
+
+        # receive reset
+        if packet.control & CONTROL_FIN:
+            self._send_control(CONTROL_FIN, b'be notified fin or reset')
+            return False
+
+        # deprecated: retransmission is requested by selective ACK
+        if packet.control & CONTROL_RTM:
+            return True
+
+        # broadcast packet
+        if packet.control & CONTROL_BCT:
+            last_packet = self.receiver_last_packet
+            if self.broadcast_hook_fnc is not None:
+                self.broadcast_hook_fnc(packet, self)
+            elif last_packet is None or last_packet.control & CONTROL_EOF:
+                self._push_receive_buffer(packet.data)
+            else:
+                # note: acquire realtime response
+                log.debug("throw away %s", packet)
+            return True
+
+        # normal data packet
+        return self._on_data(packet)
+
+    def _on_data(self, packet: Packet) -> bool:
+        """reorder data packets & push to buffer, return False when close"""
+        temporary = self.receiver_temporary
+        self.receiver_echo_time = packet.time
+
+        if packet.sequence == self.receiver_seq:
+            gap_filled = 0 < len(temporary)
+            control = packet.control
+            self.receiver_seq += 1
+            self._push_receive_buffer(packet.data)
+            count = 1
+            # drain packets that arrived early and are in order now
+            while self.receiver_seq in temporary:
+                packet = temporary.pop(self.receiver_seq)
+                control |= packet.control
+                self.receiver_seq += 1
+                self._push_receive_buffer(packet.data)
+                count += 1
+            self.receiver_last_packet = Packet(control, packet.sequence, packet.retry, packet.time, b'')
+            self.receiver_ack_pending += count
+            if gap_filled or control & CONTROL_PSH:
+                self.receiver_ack_needed = True
+            if ACK_EVERY <= self.receiver_ack_pending:
+                self._send_ack(packet.time)
+
+        elif self.receiver_seq < packet.sequence:
+            # out of order: keep it & tell the gap to the sender by selective ACK
+            if packet.sequence not in temporary:
+                temporary[packet.sequence] = packet
+                if MAX_TEMPORARY_PACKET_SIZE < len(temporary):
+                    log.error("too many temporary packets stored")
+                    return False
+            self.receiver_ack_needed = True
+
+        else:
+            # duplicated packet: our ACK may be lost
+            self.receiver_ack_needed = True
+        return True
+
+    def _send_ack(self, echo_time: float) -> None:
+        """cumulative ACK with selective ACK blocks (only backend thread)"""
+        temporary = self.receiver_temporary
+        blocks = sack_blocks(self.receiver_seq, temporary.keys()) if temporary else []
+        p = Packet(CONTROL_ACK, self.receiver_seq - 1, 0, time(), ack_body(echo_time, blocks))
+        self.sendto(self._encrypt(packet2bin(p)), self.address)
+        self.receiver_ack_pending = 0
+        self.receiver_ack_needed = False
+        self.last_ack_time = time()
+
+    def _send_control(self, control: int, data: bytes) -> None:
+        p = Packet(control, CYC_INT0, 0, time(), data)
+        self.sendto(self._encrypt(packet2bin(p)), self.address)
+
+    def _on_ack(self, packet: Packet) -> None:
+        """remove delivered segments, detect lost ones & retransmit"""
+        echo_time, blocks = parse_ack_body(packet.data)
+        now = time()
+        if 0.0 < echo_time:
+            self.rtt.update(now - echo_time)
+
+        with self.sender_buffer_lock:
+            buffer = self.sender_buffer
+            delivered = 0
+            rack_xmit_ts = self.rack_xmit_ts
+
+            # cumulative ACK: remove all seq <= ack
+            ack = packet.sequence
+            while buffer:
+                seq = next(iter(buffer))
+                if ack < seq:
+                    break
+                _, seg = buffer.popitem(last=False)
+                self.sender_buffer_bytes -= len(seg.data)
+                if seg.sacked:
+                    self.sender_sacked -= 1
+                else:
+                    delivered += 1
+                    if seg.lost:
+                        seg.lost = False
+                        self.sender_lost -= 1
+                    rack_xmit_ts = max(rack_xmit_ts, seg.xmit_time)
+
+            # selective ACK: mark received segments
+            for first, last in blocks:
+                for i in range(min(len(buffer), (last - first) % 0x100000000 + 1)):
+                    seg = buffer.get((first + i) % 0x100000000)
+                    if seg is None or seg.sacked:
+                        continue
+                    seg.sacked = True
+                    self.sender_sacked += 1
+                    delivered += 1
+                    if seg.lost:
+                        seg.lost = False
+                        self.sender_lost -= 1
+                    rack_xmit_ts = max(rack_xmit_ts, seg.xmit_time)
+
+            self.rack_xmit_ts = rack_xmit_ts
+            if 0 < delivered:
+                self.rto_start = now  # restart retransmission timer
+            if 0 < self.sender_sacked:
+                self._detect_lost()
+            self._retransmit_lost(now)
+            if not self._send_buffer_is_full():
+                self.sender_cond.notify_all()
+
+    def _detect_lost(self) -> int:
+        """
+        RACK: a segment sent sufficiently earlier than a delivered one is lost
+        (reordering window is a quarter of min RTT)
+        """
+        assert self.sender_buffer_lock.locked(), 'unlocked send_buffer!'
+        reorder_window = MIN_REORDER_WINDOW
+        if self.rtt.min_rtt != float("inf"):
+            reorder_window = max(reorder_window, self.rtt.min_rtt / 4.0)
+        threshold = self.rack_xmit_ts - reorder_window
+        found = 0
+        for seq, seg in self.sender_buffer.items():
+            if seg.sacked or seg.lost:
+                continue
+            if seg.xmit_time <= threshold:
+                seg.lost = True
+                self.sender_lost += 1
+                self.sender_lost_queue.append(seq)
+                found += 1
+        self.loss += found
+        return found
+
+    def _retransmit_lost(self, now: float) -> None:
+        """retransmit segments marked lost"""
+        assert self.sender_buffer_lock.locked(), 'unlocked send_buffer!'
+        while self.sender_lost_queue:
+            seg = self.sender_buffer.get(self.sender_lost_queue.popleft())
+            if seg is None or not seg.lost:
+                continue  # already delivered
+            seg.lost = False
+            self.sender_lost -= 1
+            seg.retry = min(255, seg.retry + 1)
+            seg.xmit_time = now
+            self.sendto(self._encrypt(packet2bin(seg.to_packet())), self.address)
+
+    def _check_retransmit_timeout(self, now: float) -> None:
+        """retransmit the oldest segment when no ACK for RTO"""
+        with self.sender_buffer_lock:
+            if len(self.sender_buffer) == 0 or now - self.rto_start < self.rtt.rto:
+                return
+            self.rtt.on_timeout()  # exponential backoff
+            self.rto_start = now
+            seq, seg = next(iter(self.sender_buffer.items()))
+            if not seg.lost:
+                seg.lost = True
+                self.sender_lost += 1
+                self.sender_lost_queue.appendleft(seq)
+                self.loss += 1
+            self._retransmit_lost(now)
 
     def _push_receive_buffer(self, data: bytes) -> None:
         """just append new data to buffer"""
@@ -727,17 +842,19 @@ class SecureReliableSocket(socket):
             # send one packet
             throw = data[window_size * i:window_size * (i + 1)]
             with self.sender_buffer_lock:
-                packet = Packet(control, self.sender_seq, 0, time(), throw.tobytes())
-                self.sender_buffer.append(packet)
-                self.sender_buffer_bytes += len(packet.data)
-                self.sendto(self._encrypt(packet2bin(packet)), self.address)
+                now = time()
+                if len(self.sender_buffer) == 0:
+                    self.rto_start = now  # start retransmission timer
+                seg = _Segment(control, self.sender_seq, throw.tobytes(), now)
+                self.sender_buffer[int(seg.sequence)] = seg
+                self.sender_buffer_bytes += len(seg.data)
                 self.sender_seq += 1
+                self.sendto(self._encrypt(packet2bin(seg.to_packet())), self.address)
             self.sender_time = time()
             send_size += len(throw)
 
             # block sendall() when buffer is full
             if buffer_is_full:
-                self.sender_signal.clear()
                 log.debug("buffer is full and wait for signaled")
                 break
         return send_size
@@ -756,17 +873,15 @@ class SecureReliableSocket(socket):
         """high-level method, use this instead of send()"""
         assert flags == 0, "unrecognized flags"
         send_size = 0
-        data = memoryview(data)
+        data = memoryview(data).cast("B")
         while send_size < len(data):
-            with self.sender_buffer_lock:
-                if not self._send_buffer_is_full():
-                    self.sender_signal.set()
-            if self.sender_signal.wait(self._timeout):
-                send_size += self._send(data[send_size:])
-            elif not self.established:
+            with self.sender_cond:
+                while self.established and self._send_buffer_is_full():
+                    if not self.sender_cond.wait(self.span):
+                        log.debug("waiting for sending buffer have space..")
+            if not self.established:
                 raise ConnectionAbortedError('disconnected')
-            else:
-                log.debug("waiting for sending buffer have space..")
+            send_size += self._send(data[send_size:])
         log.debug("send operation success %sb", send_size)
 
     def broadcast(self, data: bytes) -> None:
