@@ -467,11 +467,8 @@ class SecureReliableSocket(socket):
             """received a packet data"""
 
             try:
-                if self.receiver_seq in temporary:
-                    packet = temporary.pop(self.receiver_seq)
-                else:
-                    data, _addr = self.receiver_socket.recvfrom(65536)
-                    packet = bin2packet(self._decrypt(data))
+                data, _addr = self.receiver_socket.recvfrom(65536)
+                packet = bin2packet(self._decrypt(data))
 
                 last_receive_time = time()
                 # log.debug("r<< %s", packet)
@@ -553,6 +550,14 @@ class SecureReliableSocket(socket):
             if packet.sequence == self.receiver_seq:
                 self.receiver_seq += 1
                 self._push_receive_buffer(packet.data)
+                # drain packets that arrived early and are in order now
+                control = packet.control
+                while self.receiver_seq in temporary:
+                    packet = temporary.pop(self.receiver_seq)
+                    control |= packet.control
+                    self.receiver_seq += 1
+                    self._push_receive_buffer(packet.data)
+                packet = Packet(control, packet.sequence, packet.retry, packet.time, packet.data)
             elif packet.sequence > self.receiver_seq:
                 temporary[packet.sequence] = packet
                 # ask re-transmission if not found before packet
