@@ -52,6 +52,7 @@ import os
 
 log = logging.getLogger(__name__)
 packet_struct = Struct("<BIBd")
+ack_struct = Struct("<d")  # ACK body: [echo time 8b] (sender's time of the packet that triggered it)
 
 CONTROL_ACK = 0b00000001  # Acknowledge
 CONTROL_PSH = 0b00000010  # Push data immediately
@@ -75,6 +76,12 @@ WINDOW_MAX_SIZE = 32768  # 32kb
 SEND_BUFFER_SIZE = WINDOW_MAX_SIZE * 8  # 256kb
 MAX_RETRANSMIT_LIMIT = 4
 MAX_TEMPORARY_PACKET_SIZE = 50000
+
+# retransmission timeout (RFC 6298)
+INITIAL_RTO = 1.0  # sec
+MIN_RTO = 0.2  # sec (same as Linux)
+MAX_RTO = 60.0  # sec
+MAX_RTO_BACKOFF = 64
 SENDER_SOCKET_WAIT = 0.001  # sec
 
 # Path MTU Discovery
@@ -148,6 +155,57 @@ class CycInt(int):
 CYC_INT0 = CycInt(0)
 
 
+class RttEstimator(object):
+    """
+    smoothed RTT & retransmission timeout (RFC 6298)
+    samples are measured by echoed timestamp, so retransmitted packets are fine (no Karn's problem)
+    """
+    __slots__ = ["srtt", "rttvar", "min_rtt", "latest", "backoff"]
+
+    def __init__(self) -> None:
+        self.srtt: Optional[float] = None
+        self.rttvar = 0.0
+        self.min_rtt = float("inf")
+        self.latest = 0.0
+        self.backoff = 1
+
+    def update(self, sample: float) -> None:
+        if sample <= 0.0:
+            return
+        self.latest = sample
+        self.min_rtt = min(self.min_rtt, sample)
+        if self.srtt is None:
+            self.srtt = sample
+            self.rttvar = sample / 2.0
+        else:
+            self.rttvar = 0.75 * self.rttvar + 0.25 * abs(self.srtt - sample)
+            self.srtt = 0.875 * self.srtt + 0.125 * sample
+        self.backoff = 1
+
+    def on_timeout(self) -> None:
+        self.backoff = min(self.backoff * 2, MAX_RTO_BACKOFF)
+
+    @property
+    def rto(self) -> float:
+        if self.srtt is None:
+            base = INITIAL_RTO
+        else:
+            base = self.srtt + max(0.001, 4.0 * self.rttvar)
+        return min(MAX_RTO, max(MIN_RTO, base) * self.backoff)
+
+
+def ack_body(echo_time: float) -> bytes:
+    return ack_struct.pack(echo_time)
+
+
+def parse_ack_body(data: bytes) -> float:
+    """return echo time (0.0 means no RTT sample)"""
+    if len(data) < ack_struct.size:
+        return 0.0
+    echo_time, = ack_struct.unpack_from(data)
+    return float(echo_time)
+
+
 class Packet(NamedTuple):
     """
     static 14b
@@ -189,7 +247,7 @@ class SecureReliableSocket(socket):
         "_timeout", "span", "address", "shared_key", "mtu_size",
         "sender_seq", "sender_buffer", "sender_buffer_bytes", "sender_signal", "sender_buffer_lock", "sender_socket_optional", "sender_time",
         "receiver_seq", "receiver_unread_size", "receiver_socket",
-        "broadcast_hook_fnc", "loss", "try_connect", "established"]
+        "broadcast_hook_fnc", "loss", "try_connect", "established", "rtt"]
 
     def __init__(self, family: int = s.AF_INET, timeout: float = 21.0, span: float = 3.0) -> None:
         """
@@ -227,6 +285,9 @@ class SecureReliableSocket(socket):
         # broadcast hook
         # note: don't block this method or backend thread will be broken
         self.broadcast_hook_fnc: Optional['_BroadcastHook'] = None
+
+        # round trip time & retransmission timeout
+        self.rtt = RttEstimator()
 
         # status
         self.loss = 0
@@ -431,26 +492,30 @@ class SecureReliableSocket(socket):
         last_ack_time = time()
 
         while not self.is_closed:
-            r, _w, _x = select([self.receiver_socket.fileno()], [], [], self.span)
+            # wake up often enough to check the retransmission timer
+            select_timeout = min(self.span, self.rtt.rto / 4.0) if self.sender_buffer else self.span
+            r, _w, _x = select([self.receiver_socket.fileno()], [], [], select_timeout)
 
-            # re-transmit
+            # re-transmit (retransmission timeout)
             if 0 < len(self.sender_buffer):
                 with self.sender_buffer_lock:
-                    now = time() - self.span * 2
+                    now = time() - self.rtt.rto
                     transmit_limit = MAX_RETRANSMIT_LIMIT  # max transmit at once
                     for i, p in enumerate(self.sender_buffer):
                         if transmit_limit == 0:
                             break
                         if p.time < now:
                             self.loss += 1
-                            re_packet = Packet(p.control, p.sequence, p.retry+1, time(), p.data)
+                            re_packet = Packet(p.control, p.sequence, min(255, p.retry+1), time(), p.data)
                             self.sender_buffer[i] = re_packet
                             self.sendto(self._encrypt(packet2bin(re_packet)), self.address)
                             transmit_limit -= 1
+                    if transmit_limit < MAX_RETRANSMIT_LIMIT:
+                        self.rtt.on_timeout()  # exponential backoff
 
             # send ack as ping (stream may be free)
             if self.span < time() - last_ack_time:
-                p = Packet(CONTROL_ACK, self.receiver_seq - 1, 0, time(), b'as ping')
+                p = Packet(CONTROL_ACK, self.receiver_seq - 1, 0, time(), ack_body(0.0))
                 self.sendto(self._encrypt(packet2bin(p)), self.address)
                 last_ack_time = time()
 
@@ -483,6 +548,9 @@ class SecureReliableSocket(socket):
 
             # receive ack
             if packet.control & CONTROL_ACK:
+                echo_time = parse_ack_body(packet.data)
+                if 0.0 < echo_time:
+                    self.rtt.update(time() - echo_time)
                 with self.sender_buffer_lock:
                     if 0 < len(self.sender_buffer):
                         # remove packets confirmed by ACK (cumulative: all seq <= ack)
@@ -504,7 +572,7 @@ class SecureReliableSocket(socket):
                 with self.sender_buffer_lock:
                     for i, p in enumerate(self.sender_buffer):
                         if p.sequence == packet.sequence:
-                            re_packet = Packet(p.control, p.sequence, p.retry+1, time(), p.data)
+                            re_packet = Packet(p.control, p.sequence, min(255, p.retry+1), time(), p.data)
                             self.sender_buffer[i] = re_packet
                             self.sendto(self._encrypt(packet2bin(re_packet)), self.address)
                             retransmitted.append(packet.time)
@@ -593,7 +661,7 @@ class SecureReliableSocket(socket):
             # push buffer immediately
             if packet.control & CONTROL_PSH:
                 # send ack
-                p = Packet(CONTROL_ACK, self.receiver_seq - 1, 0, time(), b'put buffer')
+                p = Packet(CONTROL_ACK, self.receiver_seq - 1, 0, time(), ack_body(packet.time))
                 self.sendto(self._encrypt(packet2bin(p)), self.address)
                 last_ack_time = time()
                 # log.debug("pushed! buffer %d %s", len(retransmit_packets), retransmit_packets)
