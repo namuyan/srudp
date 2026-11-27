@@ -6,6 +6,7 @@ import socket as s
 import random
 import unittest
 import asyncio
+import threading
 import logging
 import os
 
@@ -36,7 +37,7 @@ def has_ipv6_loopback() -> bool:
 
 class LossySocket(SecureReliableSocket):
     """drop & reorder outgoing datagrams after established (for test)"""
-    __slots__ = ["drop_rate", "reorder_rate", "rand", "holding"]
+    __slots__ = ["drop_rate", "reorder_rate", "rand", "holding", "hold_lock"]
 
     def __init__(self, drop_rate: float, reorder_rate: float, seed: int) -> None:
         super().__init__()
@@ -44,20 +45,28 @@ class LossySocket(SecureReliableSocket):
         self.reorder_rate = reorder_rate
         self.rand = random.Random(seed)
         self.holding: Optional[Tuple[bytes, Any]] = None
+        self.hold_lock = threading.Lock()
+
+    def _release(self) -> None:
+        with self.hold_lock:
+            held, self.holding = self.holding, None
+        if held is not None:
+            super().sendto(*held)
 
     def sendto(self, data, address):  # type: ignore
         if not self.established:
             return super().sendto(data, address)
-        x = self.rand.random()
-        if x < self.drop_rate:
-            return len(data)  # lost
-        if self.holding is None and x < self.drop_rate + self.reorder_rate:
-            self.holding = (bytes(data), address)  # send after the next one
-            return len(data)
+        with self.hold_lock:
+            x = self.rand.random()
+            if x < self.drop_rate:
+                return len(data)  # lost
+            if self.holding is None and x < self.drop_rate + self.reorder_rate:
+                # send after the next one (or 5ms later)
+                self.holding = (bytes(data), address)
+                threading.Timer(0.005, self._release).start()
+                return len(data)
         size = super().sendto(data, address)
-        if self.holding is not None:
-            held, self.holding = self.holding, None
-            super().sendto(*held)
+        self._release()
         return size
 
 

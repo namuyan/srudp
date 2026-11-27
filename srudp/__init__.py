@@ -86,6 +86,8 @@ INITIAL_RTO = 1.0  # sec
 MIN_RTO = 0.2  # sec (same as Linux)
 MAX_RTO = 60.0  # sec
 MAX_RTO_BACKOFF = 64
+MIN_PTO = 0.01  # sec, tail loss probe timeout = max(2*SRTT, MIN_PTO)
+IDLE_SELECT_TIMEOUT = 0.05  # sec, backend wakes up to start timers for data sent while idle
 
 # congestion control (cwnd is counted by packets)
 INITIAL_CWND = 10.0
@@ -209,6 +211,13 @@ class RttEstimator(object):
 
     def on_timeout(self) -> None:
         self.backoff = min(self.backoff * 2, MAX_RTO_BACKOFF)
+
+    @property
+    def pto(self) -> float:
+        """probe timeout for tail loss probe"""
+        if self.srtt is None:
+            return self.rto
+        return min(self.rto, max(MIN_PTO, 2.0 * self.srtt))
 
     @property
     def rto(self) -> float:
@@ -406,7 +415,7 @@ class SecureReliableSocket(socket):
         "_timeout", "span", "address", "shared_key", "mtu_size",
         "sender_seq", "sender_buffer", "sender_buffer_bytes", "sender_buffer_lock", "sender_cond",
         "sender_sacked", "sender_lost", "sender_lost_queue", "sender_socket_optional",
-        "rack_xmit_ts", "rto_start", "cc", "pacer",
+        "rack_xmit_ts", "rto_start", "tlp_sent", "cc", "pacer",
         "receiver_seq", "receiver_unread_size", "receiver_socket", "receiver_temporary",
         "receiver_ack_pending", "receiver_ack_needed", "receiver_echo_time", "receiver_last_packet", "last_ack_time",
         "receiver_output",
@@ -443,6 +452,7 @@ class SecureReliableSocket(socket):
         self.sender_socket_optional: Optional[socket] = None
         self.rack_xmit_ts = 0.0  # transmission time of the most recently delivered segment (RACK)
         self.rto_start = 0.0  # retransmission timer started at
+        self.tlp_sent = False  # tail loss probe is sent after last progress
 
         # receiver params
         self.receiver_seq = CycInt(1)  # next receive sequence
@@ -670,7 +680,10 @@ class SecureReliableSocket(socket):
 
         while not closing and not self.is_closed:
             # wake up often enough to check the retransmission timer
-            select_timeout = min(self.span, self.rtt.rto / 4.0) if self.sender_buffer else self.span
+            if self.sender_buffer:
+                select_timeout = min(self.span, max(0.002, self.rtt.pto / 2.0))
+            else:
+                select_timeout = min(self.span, IDLE_SELECT_TIMEOUT)
             try:
                 r, _w, _x = select([self.receiver_socket.fileno()], [], [], select_timeout)
             except (OSError, ValueError):
@@ -855,6 +868,7 @@ class SecureReliableSocket(socket):
             self.rack_xmit_ts = rack_xmit_ts
             if 0 < delivered:
                 self.rto_start = now  # restart retransmission timer
+                self.tlp_sent = False
                 self.cc.on_ack(delivered, self.rtt)
             if 0 < self.sender_sacked:
                 lost_seq = self._detect_lost()
@@ -904,10 +918,35 @@ class SecureReliableSocket(socket):
             seg.xmit_time = now
             self.sendto(self._encrypt(packet2bin(seg.to_packet())), self.address)
 
+    def _send_probe(self, now: float) -> None:
+        """retransmit the newest segment not SACKed yet (tail loss probe)"""
+        assert self.sender_buffer_lock.locked(), 'unlocked send_buffer!'
+        for seg in reversed(self.sender_buffer.values()):
+            if seg.sacked:
+                continue
+            if seg.lost:
+                seg.lost = False
+                self.sender_lost -= 1
+            seg.retry = min(255, seg.retry + 1)
+            seg.xmit_time = now
+            self.sendto(self._encrypt(packet2bin(seg.to_packet())), self.address)
+            self.tlp_sent = True
+            self.loss += 1
+            return
+
     def _check_retransmit_timeout(self, now: float) -> None:
-        """no ACK for RTO: all segments in flight are lost, restart by slow start"""
+        """
+        no ACK for PTO: tail loss probe, retransmit the newest segment to get SACK
+          (lost segments sent after the last delivered one are never detected by RACK otherwise)
+        no ACK for RTO: all segments in flight are lost, restart by slow start
+        """
         with self.sender_buffer_lock:
-            if len(self.sender_buffer) == 0 or now - self.rto_start < self.rtt.rto:
+            if len(self.sender_buffer) == 0:
+                return
+            elapsed = now - self.rto_start
+            if elapsed < self.rtt.rto:
+                if not self.tlp_sent and self.rtt.pto <= elapsed:
+                    self._send_probe(now)
                 return
             self.rtt.on_timeout()  # exponential backoff
             self.cc.on_timeout(self.sender_seq)
