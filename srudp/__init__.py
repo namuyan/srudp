@@ -76,8 +76,8 @@ FLAG_NAMES = {
 }
 SEND_BUFFER_SIZE = 4 * 1024 * 1024  # 4mb, max data size waiting for ACK
 MAX_TEMPORARY_PACKET_SIZE = 50000
-RECEIVE_BATCH_SIZE = 64  # max datagrams read at once before acknowledging
-ACK_EVERY = 4  # acknowledge at least every N in-order packets
+RECEIVE_BATCH_SIZE = 128  # max datagrams read at once before acknowledging
+ACK_EVERY = 32  # acknowledge at least every N in-order packets (and at the end of each batch)
 MAX_SACK_BLOCKS = 32  # max SACK blocks in one ACK
 MIN_REORDER_WINDOW = 0.001  # sec, packet sent this earlier than a delivered one is lost
 
@@ -98,6 +98,9 @@ PACING_GAIN_SLOW_START = 2.0
 PACING_GAIN = 1.25
 PACING_BURST_TIME = 0.002  # sec, allowed burst (absorb coarse sleep() resolution)
 PACING_MIN_BURST = 16 * 1024  # bytes
+
+# OS socket buffer, absorb bursts while the backend thread is busy (decrypting etc.)
+SOCKET_BUFFER_SIZE = 1024 * 1024  # 1mb (OS may limit it smaller)
 
 # Path MTU Discovery
 IP_MTU = 14
@@ -367,6 +370,20 @@ def packet2bin(p: Packet) -> bytes:
     return packet_struct.pack(p.control, int(p.sequence), p.retry, p.time) + p.data
 
 
+def set_socket_buffer_size(sock: socket, size: int = SOCKET_BUFFER_SIZE) -> None:
+    """enlarge send/receive buffer as much as OS allows (default is ~200kb and drop packets on burst)"""
+    for option in (s.SO_RCVBUF, s.SO_SNDBUF):
+        request = size
+        while 65536 <= request:
+            try:
+                if request <= sock.getsockopt(s.SOL_SOCKET, option):
+                    break  # already enough
+                sock.setsockopt(s.SOL_SOCKET, option, request)
+                break
+            except OSError:
+                request //= 2  # e.g. macOS raise ENOBUFS when over kern.ipc.maxsockbuf
+
+
 def get_formal_address_format(address: '_WildAddress', family: int = s.AF_INET) -> '_Address':
     """tuple of ipv4/6 correct address format"""
     assert isinstance(address, tuple), "cannot recognize bytes or str format"
@@ -384,6 +401,7 @@ class SecureReliableSocket(socket):
         "rack_xmit_ts", "rto_start", "cc", "pacer",
         "receiver_seq", "receiver_unread_size", "receiver_socket", "receiver_temporary",
         "receiver_ack_pending", "receiver_ack_needed", "receiver_echo_time", "receiver_last_packet", "last_ack_time",
+        "receiver_output",
         "broadcast_hook_fnc", "loss", "try_connect", "established", "rtt"]
 
     def __init__(self, family: int = s.AF_INET, timeout: float = 21.0, span: float = 3.0) -> None:
@@ -422,11 +440,13 @@ class SecureReliableSocket(socket):
         self.receiver_seq = CycInt(1)  # next receive sequence
         self.receiver_unread_size = 0
         self.receiver_socket = socket(family, s.SOCK_DGRAM)
+        set_socket_buffer_size(self.receiver_socket)
         self.receiver_temporary: 'Dict[CycInt, Packet]' = dict()  # out-of-order packets
         self.receiver_ack_pending = 0  # in-order packets not acknowledged yet
         self.receiver_ack_needed = False  # should send ACK immediately (gap, duplicate or PSH)
         self.receiver_echo_time = 0.0  # time field of the last received data packet
         self.receiver_last_packet: Optional[Packet] = None
+        self.receiver_output: 'List[bytes]' = list()  # data to be pushed to the read buffer at once
         self.last_ack_time = 0.0
 
         # broadcast hook
@@ -489,6 +509,7 @@ class SecureReliableSocket(socket):
                 bind_addr[1] = another_port
                 self.receiver_socket.bind(tuple(bind_addr))
             self.sender_socket_optional = socket(self.family, s.SOCK_DGRAM)
+            set_socket_buffer_size(self.sender_socket_optional)
         else:
             # global
             bind_addr[0] = ""
@@ -688,7 +709,11 @@ class SecureReliableSocket(socket):
             if not closing and (self.receiver_ack_needed or 0 < self.receiver_ack_pending):
                 self._send_ack(self.receiver_echo_time)
 
+            # deliver received data to the read buffer at once (1 syscall per batch)
+            self._flush_receive_buffer()
+
         # close
+        self._flush_receive_buffer()
         log.debug("srudp socket is closing now")
         self.close()
 
@@ -891,10 +916,21 @@ class SecureReliableSocket(socket):
             self._retransmit_lost(now)
 
     def _push_receive_buffer(self, data: bytes) -> None:
-        """just append new data to buffer"""
+        """just append new data to buffer (delivered by _flush_receive_buffer)"""
+        if data:
+            self.receiver_output.append(data)
+
+    def _flush_receive_buffer(self) -> None:
+        if len(self.receiver_output) == 0:
+            return
+        data = b"".join(self.receiver_output)
+        self.receiver_output.clear()
         if self.fileno() == -1:
             return  # already closed
-        super().sendall(data)
+        try:
+            super().sendall(data)
+        except OSError:
+            return  # closed by user
         self.receiver_unread_size += len(data)
 
     def _send_buffer_is_full(self) -> bool:
