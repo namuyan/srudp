@@ -35,7 +35,7 @@ note
 """
 from typing import TYPE_CHECKING, NamedTuple, Optional, Union, Deque, Tuple, Dict, List, Iterable, Callable, Any
 from select import select
-from time import sleep, time
+from time import sleep, time, perf_counter as clock
 from collections import deque, OrderedDict
 from hashlib import sha256
 from binascii import a2b_hex
@@ -47,6 +47,7 @@ import threading
 import logging
 import atexit
 import ecdsa
+import errno
 import os
 
 
@@ -73,8 +74,7 @@ FLAG_NAMES = {
     # CONTROL_MTU: "MTU",
     CONTROL_FIN: "FIN",
 }
-WINDOW_MAX_SIZE = 32768  # 32kb
-SEND_BUFFER_SIZE = WINDOW_MAX_SIZE * 8  # 256kb
+SEND_BUFFER_SIZE = 4 * 1024 * 1024  # 4mb, max data size waiting for ACK
 MAX_TEMPORARY_PACKET_SIZE = 50000
 RECEIVE_BATCH_SIZE = 64  # max datagrams read at once before acknowledging
 ACK_EVERY = 4  # acknowledge at least every N in-order packets
@@ -86,7 +86,18 @@ INITIAL_RTO = 1.0  # sec
 MIN_RTO = 0.2  # sec (same as Linux)
 MAX_RTO = 60.0  # sec
 MAX_RTO_BACKOFF = 64
-SENDER_SOCKET_WAIT = 0.001  # sec
+
+# congestion control (cwnd is counted by packets)
+INITIAL_CWND = 10.0
+MIN_CWND = 2.0
+MAX_CWND = float(SEND_BUFFER_SIZE // 1024)
+CWND_BETA = 0.7  # multiplicative decrease factor on loss
+
+# pacing: spread packets over RTT instead of bursting cwnd at once
+PACING_GAIN_SLOW_START = 2.0
+PACING_GAIN = 1.25
+PACING_BURST_TIME = 0.002  # sec, allowed burst (absorb coarse sleep() resolution)
+PACING_MIN_BURST = 16 * 1024  # bytes
 
 # Path MTU Discovery
 IP_MTU = 14
@@ -198,6 +209,74 @@ class RttEstimator(object):
         return min(MAX_RTO, max(MIN_RTO, base) * self.backoff)
 
 
+class CongestionControl(object):
+    """
+    loss based AIMD congestion control (NewReno style slow start & congestion avoidance)
+    cwnd: max packets in flight (not ACKed & not SACKed & not lost)
+    """
+    __slots__ = ["cwnd", "ssthresh", "recovery_point"]
+
+    def __init__(self) -> None:
+        self.cwnd = INITIAL_CWND
+        self.ssthresh = float("inf")
+        self.recovery_point: Optional[CycInt] = None  # no more decrease for losses before this seq
+
+    @property
+    def in_slow_start(self) -> bool:
+        return self.cwnd < self.ssthresh
+
+    def on_ack(self, delivered: int) -> None:
+        if self.in_slow_start:
+            self.cwnd += delivered
+        else:
+            self.cwnd += delivered / self.cwnd
+        self.cwnd = min(self.cwnd, MAX_CWND)
+
+    def on_loss(self, lost_seq: CycInt, next_seq: CycInt) -> None:
+        """decrease once per round trip (loss event)"""
+        if self.recovery_point is not None and lost_seq < self.recovery_point:
+            return  # same loss event
+        self.ssthresh = max(self.cwnd * CWND_BETA, MIN_CWND)
+        self.cwnd = self.ssthresh
+        self.recovery_point = next_seq
+
+    def on_timeout(self, next_seq: CycInt) -> None:
+        self.ssthresh = max(self.cwnd * CWND_BETA, MIN_CWND)
+        self.cwnd = 1.0
+        self.recovery_point = next_seq
+
+
+class Pacer(object):
+    """token bucket to pace sending rate (rate 0.0 means no pacing)"""
+    __slots__ = ["rate", "tokens", "last"]
+
+    def __init__(self) -> None:
+        self.rate = 0.0  # bytes/sec
+        self.tokens = 0.0
+        self.last = clock()
+
+    def update(self, cwnd: float, srtt: Optional[float], packet_size: int, slow_start: bool) -> None:
+        if srtt is None or srtt <= 0.0:
+            self.rate = 0.0
+        else:
+            gain = PACING_GAIN_SLOW_START if slow_start else PACING_GAIN
+            self.rate = gain * cwnd * packet_size / srtt
+
+    def delay(self, size: int) -> float:
+        """time to wait before sending `size` bytes (consume tokens when 0.0)"""
+        rate = self.rate
+        if rate <= 0.0:
+            return 0.0
+        now = clock()
+        burst = max(PACING_MIN_BURST, rate * PACING_BURST_TIME)
+        self.tokens = min(burst, self.tokens + (now - self.last) * rate)
+        self.last = now
+        if size <= self.tokens:
+            self.tokens -= size
+            return 0.0
+        return (size - self.tokens) / rate
+
+
 def ack_body(echo_time: float, blocks: 'List[Tuple[int, int]]') -> bytes:
     """
     [echo time 8b][number of blocks 1b]([first seq 4b][last seq 4b])*n
@@ -265,7 +344,7 @@ class Packet(NamedTuple):
     control: int  # control bit
     sequence: CycInt  # packet order (cycle 4bytes uint)
     retry: int  # re-transmission count (disconnected before overflow)
-    time: float  # unix time (double)
+    time: float  # sender's clock (double), echoed by ACK to measure RTT
     data: bytes  # data body
 
     def __repr__(self) -> str:
@@ -297,8 +376,8 @@ class SecureReliableSocket(socket):
     __slots__ = [
         "_timeout", "span", "address", "shared_key", "mtu_size",
         "sender_seq", "sender_buffer", "sender_buffer_bytes", "sender_buffer_lock", "sender_cond",
-        "sender_sacked", "sender_lost", "sender_lost_queue", "sender_socket_optional", "sender_time",
-        "rack_xmit_ts", "rto_start",
+        "sender_sacked", "sender_lost", "sender_lost_queue", "sender_socket_optional",
+        "rack_xmit_ts", "rto_start", "cc", "pacer",
         "receiver_seq", "receiver_unread_size", "receiver_socket", "receiver_temporary",
         "receiver_ack_pending", "receiver_ack_needed", "receiver_echo_time", "receiver_last_packet", "last_ack_time",
         "broadcast_hook_fnc", "loss", "try_connect", "established", "rtt"]
@@ -321,7 +400,6 @@ class SecureReliableSocket(socket):
         self.address: '_Address' = None
         self.shared_key: bytes = None
         self.mtu_size = 0  # 1472b
-        self.sender_time = 0.0
 
         # sender params
         self.sender_seq = CycInt(1)  # next send sequence
@@ -353,6 +431,9 @@ class SecureReliableSocket(socket):
 
         # round trip time & retransmission timeout
         self.rtt = RttEstimator()
+        # congestion control & pacing
+        self.cc = CongestionControl()
+        self.pacer = Pacer()
 
         # status
         self.loss = 0
@@ -549,8 +630,8 @@ class SecureReliableSocket(socket):
 
     def _backend(self) -> None:
         """receive packets, reorder sequence, fill output buffer & manage retransmission"""
-        last_receive_time = time()
-        self.last_ack_time = time()
+        last_receive_time = clock()
+        self.last_ack_time = clock()
         self.receiver_socket.setblocking(False)
         closing = False
 
@@ -561,7 +642,7 @@ class SecureReliableSocket(socket):
                 r, _w, _x = select([self.receiver_socket.fileno()], [], [], select_timeout)
             except (OSError, ValueError):
                 break  # socket closed
-            now = time()
+            now = clock()
 
             # retransmission timeout
             self._check_retransmit_timeout(now)
@@ -594,7 +675,7 @@ class SecureReliableSocket(socket):
                     packet = bin2packet(self._decrypt(data))
                 except (ValueError, StructError):
                     continue  # decrypt failed or broken packet
-                last_receive_time = time()
+                last_receive_time = clock()
                 if not self._on_packet(packet):
                     closing = True
                     break
@@ -681,20 +762,20 @@ class SecureReliableSocket(socket):
         """cumulative ACK with selective ACK blocks (only backend thread)"""
         temporary = self.receiver_temporary
         blocks = sack_blocks(self.receiver_seq, temporary.keys()) if temporary else []
-        p = Packet(CONTROL_ACK, self.receiver_seq - 1, 0, time(), ack_body(echo_time, blocks))
+        p = Packet(CONTROL_ACK, self.receiver_seq - 1, 0, clock(), ack_body(echo_time, blocks))
         self.sendto(self._encrypt(packet2bin(p)), self.address)
         self.receiver_ack_pending = 0
         self.receiver_ack_needed = False
-        self.last_ack_time = time()
+        self.last_ack_time = clock()
 
     def _send_control(self, control: int, data: bytes) -> None:
-        p = Packet(control, CYC_INT0, 0, time(), data)
+        p = Packet(control, CYC_INT0, 0, clock(), data)
         self.sendto(self._encrypt(packet2bin(p)), self.address)
 
     def _on_ack(self, packet: Packet) -> None:
         """remove delivered segments, detect lost ones & retransmit"""
         echo_time, blocks = parse_ack_body(packet.data)
-        now = time()
+        now = clock()
         if 0.0 < echo_time:
             self.rtt.update(now - echo_time)
 
@@ -737,13 +818,16 @@ class SecureReliableSocket(socket):
             self.rack_xmit_ts = rack_xmit_ts
             if 0 < delivered:
                 self.rto_start = now  # restart retransmission timer
+                self.cc.on_ack(delivered)
             if 0 < self.sender_sacked:
-                self._detect_lost()
+                lost_seq = self._detect_lost()
+                if lost_seq is not None:
+                    self.cc.on_loss(lost_seq, self.sender_seq)
+            self.pacer.update(self.cc.cwnd, self.rtt.srtt, self.mtu_size, self.cc.in_slow_start)
             self._retransmit_lost(now)
-            if not self._send_buffer_is_full():
-                self.sender_cond.notify_all()
+            self.sender_cond.notify_all()
 
-    def _detect_lost(self) -> int:
+    def _detect_lost(self) -> Optional[CycInt]:
         """
         RACK: a segment sent sufficiently earlier than a delivered one is lost
         (reordering window is a quarter of min RTT)
@@ -753,7 +837,7 @@ class SecureReliableSocket(socket):
         if self.rtt.min_rtt != float("inf"):
             reorder_window = max(reorder_window, self.rtt.min_rtt / 4.0)
         threshold = self.rack_xmit_ts - reorder_window
-        found = 0
+        first_lost: Optional[CycInt] = None
         for seq, seg in self.sender_buffer.items():
             if seg.sacked or seg.lost:
                 continue
@@ -761,14 +845,19 @@ class SecureReliableSocket(socket):
                 seg.lost = True
                 self.sender_lost += 1
                 self.sender_lost_queue.append(seq)
-                found += 1
-        self.loss += found
-        return found
+                self.loss += 1
+                if first_lost is None:
+                    first_lost = seg.sequence
+        return first_lost
+
+    def _pipe(self) -> int:
+        """number of packets in flight"""
+        return len(self.sender_buffer) - self.sender_sacked - self.sender_lost
 
     def _retransmit_lost(self, now: float) -> None:
-        """retransmit segments marked lost"""
+        """retransmit segments marked lost (limited by congestion window)"""
         assert self.sender_buffer_lock.locked(), 'unlocked send_buffer!'
-        while self.sender_lost_queue:
+        while self.sender_lost_queue and self._pipe() < self.cc.cwnd:
             seg = self.sender_buffer.get(self.sender_lost_queue.popleft())
             if seg is None or not seg.lost:
                 continue  # already delivered
@@ -779,17 +868,21 @@ class SecureReliableSocket(socket):
             self.sendto(self._encrypt(packet2bin(seg.to_packet())), self.address)
 
     def _check_retransmit_timeout(self, now: float) -> None:
-        """retransmit the oldest segment when no ACK for RTO"""
+        """no ACK for RTO: all segments in flight are lost, restart by slow start"""
         with self.sender_buffer_lock:
             if len(self.sender_buffer) == 0 or now - self.rto_start < self.rtt.rto:
                 return
             self.rtt.on_timeout()  # exponential backoff
+            self.cc.on_timeout(self.sender_seq)
             self.rto_start = now
-            seq, seg = next(iter(self.sender_buffer.items()))
-            if not seg.lost:
+            self.sender_lost_queue.clear()
+            self.sender_lost = 0
+            for seq, seg in self.sender_buffer.items():
+                if seg.sacked:
+                    continue
                 seg.lost = True
                 self.sender_lost += 1
-                self.sender_lost_queue.appendleft(seq)
+                self.sender_lost_queue.append(seq)
                 self.loss += 1
             self._retransmit_lost(now)
 
@@ -803,6 +896,11 @@ class SecureReliableSocket(socket):
     def _send_buffer_is_full(self) -> bool:
         assert self.sender_buffer_lock.locked(), 'unlocked send_buffer!'
         return SEND_BUFFER_SIZE < self.sender_buffer_bytes
+
+    def _can_send_new(self) -> bool:
+        """congestion window has space & no lost segments waiting for retransmission"""
+        assert self.sender_buffer_lock.locked(), 'unlocked send_buffer!'
+        return self.sender_lost == 0 and self._pipe() < self.cc.cwnd and not self._send_buffer_is_full()
 
     def get_window_size(self) -> int:
         """maximum size of data you can send at once"""
@@ -818,45 +916,41 @@ class SecureReliableSocket(socket):
 
     def _send(self, data: memoryview) -> int:
         """warning: row-level method"""
-        if not self.established:
-            raise ConnectionAbortedError('disconnected')
-
         window_size = self.get_window_size()
         length = len(data) // window_size
         send_size = 0
         for i in range(length + 1):
+            # wait for congestion window
+            with self.sender_cond:
+                while self.established and not self._can_send_new():
+                    if not self.sender_cond.wait(self.span):
+                        log.debug("waiting for congestion window..")
+            if not self.established:
+                raise ConnectionAbortedError('disconnected')
+
+            # wait for pacing
+            throw = data[window_size * i:window_size * (i + 1)]
+            delay = self.pacer.delay(len(throw) + packet_struct.size)
+            while 0.0 < delay:
+                sleep(delay)
+                delay = self.pacer.delay(len(throw) + packet_struct.size)
+
             # control flag
             control = 0b00000000
-            with self.sender_buffer_lock:
-                buffer_is_full = self._send_buffer_is_full()
-            if i == length or buffer_is_full:
-                control |= CONTROL_PSH
             if i == length:
-                control |= CONTROL_EOF
-
-            # note: sleep at least SOCKET_WAIT mSec to avoid packet loss
-            space_time = SENDER_SOCKET_WAIT - time() + self.sender_time
-            if 0.0 < space_time:
-                sleep(space_time)
+                control |= CONTROL_PSH | CONTROL_EOF
 
             # send one packet
-            throw = data[window_size * i:window_size * (i + 1)]
             with self.sender_buffer_lock:
-                now = time()
+                now = clock()
                 if len(self.sender_buffer) == 0:
                     self.rto_start = now  # start retransmission timer
                 seg = _Segment(control, self.sender_seq, throw.tobytes(), now)
                 self.sender_buffer[int(seg.sequence)] = seg
                 self.sender_buffer_bytes += len(seg.data)
                 self.sender_seq += 1
-                self.sendto(self._encrypt(packet2bin(seg.to_packet())), self.address)
-            self.sender_time = time()
+            self.sendto(self._encrypt(packet2bin(seg.to_packet())), self.address)
             send_size += len(throw)
-
-            # block sendall() when buffer is full
-            if buffer_is_full:
-                log.debug("buffer is full and wait for signaled")
-                break
         return send_size
 
     def sendto(self, data: 'ReadableBuffer', address: '_Address') -> int:  # type: ignore
@@ -864,24 +958,25 @@ class SecureReliableSocket(socket):
         # note: sendto() after bind() with different port cause OSError on recvfrom()
         if self.is_closed:
             return 0
-        elif self.sender_socket_optional is None:
-            return self.receiver_socket.sendto(data, address)
-        else:
-            return self.sender_socket_optional.sendto(data, address)
+        try:
+            if self.sender_socket_optional is None:
+                return self.receiver_socket.sendto(data, address)
+            else:
+                return self.sender_socket_optional.sendto(data, address)
+        except OSError as e:
+            if self.established and e.errno in (errno.EAGAIN, errno.EWOULDBLOCK, errno.ENOBUFS):
+                return 0  # OS buffer is full, same as packet loss (retransmitted later)
+            raise
 
     def sendall(self, data: 'ReadableBuffer', flags: int = 0) -> None:
         """high-level method, use this instead of send()"""
         assert flags == 0, "unrecognized flags"
-        send_size = 0
-        data = memoryview(data).cast("B")
-        while send_size < len(data):
-            with self.sender_cond:
-                while self.established and self._send_buffer_is_full():
-                    if not self.sender_cond.wait(self.span):
-                        log.debug("waiting for sending buffer have space..")
-            if not self.established:
-                raise ConnectionAbortedError('disconnected')
-            send_size += self._send(data[send_size:])
+        if not self.established:
+            raise ConnectionAbortedError('disconnected')
+        view = memoryview(data).cast("B")
+        if len(view) == 0:
+            return
+        send_size = self._send(view)
         log.debug("send operation success %sb", send_size)
 
     def broadcast(self, data: bytes) -> None:
